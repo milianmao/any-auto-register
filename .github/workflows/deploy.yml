@@ -118,6 +118,10 @@ jobs:
             EOF
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker container prune -f
+            docker image prune -af
+            docker builder prune -af
+            docker system df
             $COMPOSE -f docker-compose.deploy.yml pull
             $COMPOSE -f docker-compose.deploy.yml up -d --remove-orphans
             $COMPOSE -f docker-compose.deploy.yml ps
