@@ -196,6 +196,59 @@ def _open_url_system_browser(url: str) -> bool:
     return False
 
 
+def generate_plus_hosted_link(
+    account,
+    proxy: Optional[str] = None,
+    country: str = "US",
+) -> str:
+    """生成 Plus Stripe Hosted 长链接（可直接在浏览器打开完成支付）"""
+    if not account.access_token:
+        raise ValueError("账号缺少 access_token")
+
+    currency = _COUNTRY_CURRENCY_MAP.get(country, "USD")
+    headers = {
+        "Authorization": f"Bearer {account.access_token}",
+        "Content-Type": "application/json",
+    }
+    if getattr(account, "cookies", ""):
+        headers["cookie"] = account.cookies
+        oai_did = _extract_oai_did(account.cookies)
+        if oai_did:
+            headers["oai-device-id"] = oai_did
+
+    payload = {
+        "plan_name": "chatgptplusplan",
+        "billing_details": {"country": country, "currency": currency},
+        "cancel_url": "https://chatgpt.com/#pricing",
+        "promo_campaign": {
+            "promo_campaign_id": "plus-1-month-free",
+            "is_coupon_from_query_param": False,
+        },
+        "checkout_ui_mode": "hosted",
+    }
+
+    resp = cffi_requests.post(
+        PAYMENT_CHECKOUT_URL,
+        headers=headers,
+        json=payload,
+        proxies=_build_proxies(proxy),
+        timeout=30,
+        impersonate="chrome124",
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    hosted_url = data.get("url") or data.get("stripe_hosted_url") or data.get("checkout_url")
+    if hosted_url:
+        logger.info(f"Stripe hosted 链接生成成功: {hosted_url[:80]}...")
+        return hosted_url
+
+    if "checkout_session_id" in data:
+        return TEAM_CHECKOUT_BASE_URL + data["checkout_session_id"]
+
+    raise ValueError(data.get("detail", "API 未返回 hosted URL 或 checkout_session_id"))
+
+
 def generate_plus_link(
     account: Account,
     proxy: Optional[str] = None,

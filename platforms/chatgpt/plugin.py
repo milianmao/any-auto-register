@@ -236,6 +236,36 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "plan", "label": "套餐", "type": "select",
                   "options": ["plus", "team"]},
              ]},
+            {"id": "auto_payment", "label": "自动支付 Plus (浏览器模式)",
+             "params": [
+                 {"key": "country", "label": "地区", "type": "select",
+                  "options": ["US", "DE", "GB", "FR", "CA", "AU"]},
+                 {"key": "headless", "label": "无头模式", "type": "select",
+                  "options": ["true", "false"]},
+                 {"key": "phone", "label": "电话号码(不接码时用)", "type": "text"},
+                 {"key": "card_number", "label": "卡号", "type": "text"},
+                 {"key": "card_expiry", "label": "有效期 (MM / YY)", "type": "text"},
+                 {"key": "card_cvv", "label": "CVV", "type": "text"},
+                 {"key": "sms_provider", "label": "接码平台", "type": "select",
+                  "options": ["", "sms_activate", "herosms", "smsbower", "uukg"]},
+                 {"key": "sms_api_key", "label": "接码 API Key", "type": "text"},
+                 {"key": "sms_country", "label": "接码国家", "type": "text"},
+                 {"key": "uukg_codes", "label": "UUKG 卡密(一行一个)", "type": "textarea"},
+             ]},
+            {"id": "auto_payment_protocol", "label": "自动支付 Plus (协议模式)",
+             "params": [
+                 {"key": "country", "label": "地区", "type": "select",
+                  "options": ["US", "DE", "GB", "FR", "CA", "AU"]},
+                 {"key": "phone", "label": "电话号码(不接码时用)", "type": "text"},
+                 {"key": "card_number", "label": "卡号", "type": "text"},
+                 {"key": "card_expiry", "label": "有效期 (MM / YY)", "type": "text"},
+                 {"key": "card_cvv", "label": "CVV", "type": "text"},
+                 {"key": "sms_provider", "label": "接码平台", "type": "select",
+                  "options": ["", "sms_activate", "herosms", "smsbower", "uukg"]},
+                 {"key": "sms_api_key", "label": "接码 API Key", "type": "text"},
+                 {"key": "sms_country", "label": "接码国家", "type": "text"},
+                 {"key": "uukg_codes", "label": "UUKG 卡密(一行一个)", "type": "textarea"},
+             ]},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
@@ -331,6 +361,60 @@ class ChatGPTPlatform(BasePlatform):
             ok, msg = upload_to_team_manager(a, api_url=params.get("api_url"),
                                              api_key=params.get("api_key"))
             return {"ok": ok, "data": msg}
+
+        if action_id == "auto_payment":
+            from platforms.chatgpt.auto_payment import auto_pay_plus, PaymentConfig
+            pay_config = PaymentConfig(
+                country=params.get("country", "US"),
+                proxy=proxy,
+                headless=str(params.get("headless", "true")).lower() == "true",
+                payment_timeout=int(params.get("payment_timeout", 300)),
+                phone=params.get("phone", ""),
+                card_number=params.get("card_number", ""),
+                card_expiry=params.get("card_expiry", ""),
+                card_cvv=params.get("card_cvv", ""),
+                sms_provider=params.get("sms_provider", ""),
+                sms_api_key=params.get("sms_api_key", ""),
+                sms_country=params.get("sms_country", ""),
+                uukg_codes=params.get("uukg_codes", ""),
+            )
+            pay_result = auto_pay_plus(a, pay_config)
+            if pay_result.success:
+                return {"ok": True, "data": {
+                    "message": "Plus 支付成功",
+                    "paypal_email": pay_result.paypal_email,
+                    "hosted_url": pay_result.hosted_url,
+                    "subscription_status": pay_result.subscription_status,
+                }}
+            return {"ok": False, "error": pay_result.error, "data": {
+                "hosted_url": pay_result.hosted_url,
+            }}
+
+        if action_id == "auto_payment_protocol":
+            from platforms.chatgpt.auto_payment_protocol import auto_pay_plus_protocol, ProtocolPaymentConfig
+            pay_config = ProtocolPaymentConfig(
+                country=params.get("country", "US"),
+                proxy=proxy,
+                phone=params.get("phone", ""),
+                card_number=params.get("card_number", ""),
+                card_expiry=params.get("card_expiry", ""),
+                card_cvv=params.get("card_cvv", ""),
+                sms_provider=params.get("sms_provider", ""),
+                sms_api_key=params.get("sms_api_key", ""),
+                sms_country=params.get("sms_country", ""),
+                uukg_codes=params.get("uukg_codes", ""),
+            )
+            pay_result = auto_pay_plus_protocol(a, pay_config)
+            if pay_result.success:
+                return {"ok": True, "data": {
+                    "message": "Plus 支付成功 (协议模式)",
+                    "paypal_email": pay_result.paypal_email,
+                    "hosted_url": pay_result.hosted_url,
+                    "subscription_status": pay_result.subscription_status,
+                }}
+            return {"ok": False, "error": pay_result.error, "data": {
+                "hosted_url": pay_result.hosted_url,
+            }}
 
         raise NotImplementedError(f"Unknown action: {action_id}")
 

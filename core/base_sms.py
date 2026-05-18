@@ -1097,6 +1097,15 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
             reuse_phone_to_max=_safe_bool(config.get("register_reuse_phone_to_max"), True),
             phone_success_max=max(0, _safe_int(config.get("register_phone_extra_max") or config.get("register_phone_success_max"), 3)),
         )
+    if provider_key in ("uukg", "uukg_api"):
+        from providers.sms.uukg import UukgSmsProvider
+        codes_raw = config.get("uukg_codes", "")
+        codes = [c.strip() for c in codes_raw.splitlines() if c.strip()] if codes_raw else None
+        return UukgSmsProvider(
+            api_key=str(config.get("uukg_api_key", "") or "").strip(),
+            codes=codes,
+            proxy=str(config.get("sms_proxy") or config.get("proxy") or "") or None,
+        )
     raise RuntimeError(f"未知的接码服务: {provider_key}")
 
 

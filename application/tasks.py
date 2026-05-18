@@ -629,6 +629,64 @@ def _int_config(value: Any, default: int) -> int:
         return default
 
 
+def _auto_followup_chatgpt_payment(
+    *,
+    platform_name: str,
+    payload: dict[str, Any],
+    account,
+    logger: "TaskLogger",
+    resolved_proxy: str | None = None,
+) -> None:
+    """注册成功后自动完成 ChatGPT Plus 支付（PayPal 流程）"""
+    if platform_name != "chatgpt":
+        return
+    extra = dict(payload.get("extra") or {})
+    if not _bool_config(extra.get("auto_payment"), False):
+        return
+
+    logger.log("[支付] 检测到 auto_payment 配置，开始自动支付流程...")
+    try:
+        from platforms.chatgpt.auto_payment import auto_pay_plus, PaymentConfig
+
+        pay_config = PaymentConfig(
+            country=str(extra.get("payment_country", "US") or "US"),
+            proxy=resolved_proxy,
+            headless=_bool_config(extra.get("payment_headless"), True),
+            sms_provider=str(extra.get("sms_provider", "sms_activate") or "sms_activate"),
+            sms_api_key=str(extra.get("sms_api_key", "") or extra.get("sms_activate_api_key", "") or ""),
+            sms_country=str(extra.get("sms_country", "") or ""),
+            payment_timeout=_int_config(extra.get("payment_timeout"), 300),
+        )
+
+        class _AccountProxy:
+            pass
+
+        a = _AccountProxy()
+        account_extra = account.extra or {}
+        a.access_token = account_extra.get("access_token") or account.token
+        a.cookies = account_extra.get("cookies", "")
+        a.session_token = account_extra.get("session_token", "")
+
+        pay_result = auto_pay_plus(a, pay_config, log_fn=logger.log)
+
+        if pay_result.success:
+            logger.log(f"[支付] Plus 支付成功! PayPal: {pay_result.paypal_email}")
+            merged_extra = dict(account.extra or {})
+            merged_extra["subscription_status"] = "plus"
+            merged_extra["paypal_email"] = pay_result.paypal_email
+            merged_extra["payment_url"] = pay_result.hosted_url
+            account.extra = merged_extra
+            save_account(account)
+        else:
+            error_msg = f"[支付] Plus 支付失败: {pay_result.error}"
+            logger.log(error_msg, level="warning")
+            if pay_result.hosted_url:
+                logger.add_cashier_url(pay_result.hosted_url)
+                logger.log(f"[支付] 手动支付链接: {pay_result.hosted_url}")
+    except Exception as exc:
+        logger.log(f"[支付] 自动支付异常: {exc}", level="warning")
+
+
 def _auto_followup_windsurf_payment(
     *,
     platform_name: str,
@@ -764,6 +822,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 platform=platform,
                 account=account,
                 logger=logger,
+            )
+            _auto_followup_chatgpt_payment(
+                platform_name=platform_name,
+                payload=payload,
+                account=account,
+                logger=logger,
+                resolved_proxy=resolved_proxy,
             )
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
