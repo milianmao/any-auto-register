@@ -70,11 +70,11 @@ jobs:
           password: ${{ secrets.DEPLOY_PASSWORD }}
           port: ${{ secrets.DEPLOY_PORT }}
           envs: DEPLOY_PATH,IMAGE_NAME,IMAGE_TAG,REPOSITORY_URL,DEPLOY_BRANCH,GHCR_USER,GHCR_TOKEN
-          script_stop: true
+          command_timeout: 30m
           script: |
             set -eu
 
-            if command -v docker compose >/dev/null 2>&1; then
+            if docker compose version >/dev/null 2>&1; then
               COMPOSE="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               COMPOSE="docker-compose"
@@ -89,11 +89,15 @@ jobs:
               git -C "$DEPLOY_PATH" remote set-url origin "$REPOSITORY_URL"
               git -C "$DEPLOY_PATH" fetch --prune origin "$DEPLOY_BRANCH"
               git -C "$DEPLOY_PATH" reset --hard "origin/$DEPLOY_BRANCH"
-            elif [ -z "$(find "$DEPLOY_PATH" -mindepth 1 -maxdepth 1 ! -name data -print -quit)" ]; then
-              git clone --branch "$DEPLOY_BRANCH" "$REPOSITORY_URL" "$DEPLOY_PATH"
             else
-              echo "$DEPLOY_PATH is not a git repository and is not empty. Move existing files aside before deploying." >&2
-              exit 1
+              BACKUP_PATH="${DEPLOY_PATH}.backup.$(date +%Y%m%d%H%M%S)"
+              mkdir -p "$BACKUP_PATH"
+
+              find "$DEPLOY_PATH" -mindepth 1 -maxdepth 1 ! -name data -exec mv {} "$BACKUP_PATH"/ \;
+              git clone --branch "$DEPLOY_BRANCH" "$REPOSITORY_URL" "$DEPLOY_PATH.tmp"
+              find "$DEPLOY_PATH.tmp" -mindepth 1 -maxdepth 1 -exec mv {} "$DEPLOY_PATH"/ \;
+              rmdir "$DEPLOY_PATH.tmp"
+              echo "Previous non-data files were moved to $BACKUP_PATH"
             fi
 
             cd "$DEPLOY_PATH"
