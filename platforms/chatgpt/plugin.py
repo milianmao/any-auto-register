@@ -6,6 +6,8 @@ from core.registration import BrowserRegistrationAdapter, OtpSpec, ProtocolMailb
 from core.registration.helpers import resolve_timeout
 from core.registry import register
 
+DEFAULT_CHATGPT_REGISTRATION_PASSWORD = "*Yml1145909208"
+
 
 def _result_text(result, key: str) -> str:
     if isinstance(result, dict):
@@ -122,7 +124,7 @@ class ChatGPTPlatform(BasePlatform):
     def _prepare_registration_password(self, password: str | None) -> str | None:
         if password:
             return password
-        return _generate_chatgpt_registration_password()
+        return DEFAULT_CHATGPT_REGISTRATION_PASSWORD
 
     def _map_chatgpt_result(self, result: dict, *, password: str = "", user_id: str = "") -> RegistrationResult:
         _assert_complete_oauth_callback(result)
@@ -140,6 +142,7 @@ class ChatGPTPlatform(BasePlatform):
                 "workspace_id": result.get("workspace_id", ""),
                 "cookies": result.get("cookies", ""),
                 "profile": result.get("profile", {}),
+                "session_payload": result.get("session_payload", {}),
             },
         )
 
@@ -166,6 +169,7 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=artifacts.otp_callback,
                 phone_callback=artifacts.phone_callback,
                 log_fn=ctx.log,
+                keep_browser_open_on_failure=bool(ctx.extra.get("keep_browser_open_on_failure")),
             ),
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(
                 email=ctx.identity.email or "",
@@ -173,7 +177,7 @@ class ChatGPTPlatform(BasePlatform):
             ),
             oauth_runner=self._run_protocol_oauth,
             capability=RegistrationCapability(oauth_headless_requires_browser_reuse=True),
-            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600),
+            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600, resend_after=30),
         )
 
     def build_protocol_oauth_adapter(self):
@@ -236,8 +240,11 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "plan", "label": "套餐", "type": "select",
                   "options": ["plus", "team"]},
              ]},
-            {"id": "auto_payment", "label": "自动支付 Plus (浏览器模式)",
+            {"id": "auto_payment", "label": "自动支付 Plus",
              "params": [
+                 {"key": "payment_mode", "label": "支付模式", "type": "select",
+                  "options": ["protocol", "browser"],
+                  "labels": {"protocol": "协议模式(推荐)", "browser": "浏览器模式"}},
                  {"key": "country", "label": "地区", "type": "select",
                   "options": ["US", "DE", "GB", "FR", "CA", "AU"]},
                  {"key": "headless", "label": "无头模式", "type": "select",
@@ -251,22 +258,6 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "sms_api_key", "label": "接码 API Key", "type": "text"},
                  {"key": "sms_country", "label": "接码国家", "type": "text"},
                  {"key": "uukg_codes", "label": "UUKG 卡密(一行一个)", "type": "textarea"},
-             ]},
-            {"id": "auto_payment_protocol", "label": "自动支付 Plus (协议模式)",
-             "params": [
-                 {"key": "country", "label": "地区", "type": "select",
-                  "options": ["US", "DE", "GB", "FR", "CA", "AU"]},
-                 {"key": "phone", "label": "电话号码(不接码时用)", "type": "text"},
-                 {"key": "card_number", "label": "卡号", "type": "text"},
-                 {"key": "card_expiry", "label": "有效期 (MM / YY)", "type": "text"},
-                 {"key": "card_cvv", "label": "CVV", "type": "text"},
-                 {"key": "sms_provider", "label": "接码平台", "type": "select",
-                  "options": ["", "sms_activate", "herosms", "smsbower", "uukg"]},
-                 {"key": "sms_api_key", "label": "接码 API Key", "type": "text"},
-                 {"key": "sms_country", "label": "接码国家", "type": "text"},
-                 {"key": "uukg_codes", "label": "UUKG 卡密(一行一个)", "type": "textarea"},
-                 {"key": "headless", "label": "无头模式(PayPal)", "type": "select",
-                  "options": ["true", "false"]},
              ]},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
@@ -365,52 +356,47 @@ class ChatGPTPlatform(BasePlatform):
             return {"ok": ok, "data": msg}
 
         if action_id == "auto_payment":
-            from platforms.chatgpt.auto_payment import auto_pay_plus, PaymentConfig
-            pay_config = PaymentConfig(
-                country=params.get("country", "US"),
-                proxy=proxy,
-                headless=str(params.get("headless", "true")).lower() == "true",
-                payment_timeout=int(params.get("payment_timeout", 300)),
-                phone=params.get("phone", ""),
-                card_number=params.get("card_number", ""),
-                card_expiry=params.get("card_expiry", ""),
-                card_cvv=params.get("card_cvv", ""),
-                sms_provider=params.get("sms_provider", ""),
-                sms_api_key=params.get("sms_api_key", ""),
-                sms_country=params.get("sms_country", ""),
-                uukg_codes=params.get("uukg_codes", ""),
-            )
-            pay_result = auto_pay_plus(a, pay_config)
-            if pay_result.success:
-                return {"ok": True, "data": {
-                    "message": "Plus 支付成功",
-                    "paypal_email": pay_result.paypal_email,
-                    "hosted_url": pay_result.hosted_url,
-                    "subscription_status": pay_result.subscription_status,
-                }}
-            return {"ok": False, "error": pay_result.error, "data": {
-                "hosted_url": pay_result.hosted_url,
-            }}
+            payment_mode = params.get("payment_mode", "protocol")
+            headless = str(params.get("headless", "true")).lower() == "true"
 
-        if action_id == "auto_payment_protocol":
-            from platforms.chatgpt.auto_payment_protocol import auto_pay_plus_protocol, ProtocolPaymentConfig
-            pay_config = ProtocolPaymentConfig(
-                country=params.get("country", "US"),
-                proxy=proxy,
-                headless=params.get("headless", "true").lower() != "false",
-                phone=params.get("phone", ""),
-                card_number=params.get("card_number", ""),
-                card_expiry=params.get("card_expiry", ""),
-                card_cvv=params.get("card_cvv", ""),
-                sms_provider=params.get("sms_provider", ""),
-                sms_api_key=params.get("sms_api_key", ""),
-                sms_country=params.get("sms_country", ""),
-                uukg_codes=params.get("uukg_codes", ""),
-            )
-            pay_result = auto_pay_plus_protocol(a, pay_config)
+            if payment_mode == "browser":
+                from platforms.chatgpt.auto_payment import auto_pay_plus, PaymentConfig
+                pay_config = PaymentConfig(
+                    country=params.get("country", "US"),
+                    proxy=proxy,
+                    headless=headless,
+                    payment_timeout=int(params.get("payment_timeout", 300)),
+                    phone=params.get("phone", ""),
+                    card_number=params.get("card_number", ""),
+                    card_expiry=params.get("card_expiry", ""),
+                    card_cvv=params.get("card_cvv", ""),
+                    sms_provider=params.get("sms_provider", ""),
+                    sms_api_key=params.get("sms_api_key", ""),
+                    sms_country=params.get("sms_country", ""),
+                    uukg_codes=params.get("uukg_codes", ""),
+                )
+                pay_result = auto_pay_plus(a, pay_config)
+            else:
+                from platforms.chatgpt.auto_payment_protocol import auto_pay_plus_protocol, ProtocolPaymentConfig
+                pay_config = ProtocolPaymentConfig(
+                    country=params.get("country", "US"),
+                    proxy=proxy,
+                    headless=headless,
+                    phone=params.get("phone", ""),
+                    card_number=params.get("card_number", ""),
+                    card_expiry=params.get("card_expiry", ""),
+                    card_cvv=params.get("card_cvv", ""),
+                    sms_provider=params.get("sms_provider", ""),
+                    sms_api_key=params.get("sms_api_key", ""),
+                    sms_country=params.get("sms_country", ""),
+                    uukg_codes=params.get("uukg_codes", ""),
+                )
+                pay_result = auto_pay_plus_protocol(a, pay_config)
+
+            mode_label = "浏览器模式" if payment_mode == "browser" else "协议模式"
             if pay_result.success:
                 return {"ok": True, "data": {
-                    "message": "Plus 支付成功 (协议模式)",
+                    "message": f"Plus 支付成功 ({mode_label})",
                     "paypal_email": pay_result.paypal_email,
                     "hosted_url": pay_result.hosted_url,
                     "subscription_status": pay_result.subscription_status,

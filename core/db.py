@@ -128,6 +128,35 @@ class ProviderResourceModel(SQLModel, table=True):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class FailedMailboxModel(SQLModel, table=True):
+    __tablename__ = "failed_mailboxes"
+    __table_args__ = (
+        UniqueConstraint("platform", "email", name="uq_failed_mailboxes_platform_email"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_type: str = Field(default="mailbox", index=True)
+    provider_name: str = Field(default="", index=True)
+    resource_identifier: str = Field(default="", index=True)
+    platform: str = Field(index=True)
+    email: str = Field(index=True)
+    failure_stage: str = ""
+    failure_reason: str = ""
+    retryable: bool = True
+    blocked_until: Optional[datetime] = None
+    fail_count: int = 1
+    last_task_id: str = ""
+    metadata_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_metadata(self) -> dict:
+        return json.loads(self.metadata_json or "{}")
+
+    def set_metadata(self, data: dict):
+        self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
+
+
 class ProviderDefinitionModel(SQLModel, table=True):
     __tablename__ = "provider_definitions"
     __table_args__ = (

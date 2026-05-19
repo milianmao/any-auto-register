@@ -14,6 +14,7 @@ import {
   History,
   LayoutDashboard,
   Moon,
+  Play,
   Settings as SettingsIcon,
   Sun,
   Monitor,
@@ -29,6 +30,7 @@ import {
 type NavItem = { path: string; label: string; icon: any; exact?: boolean }
 
 const NAV_ITEMS: NavItem[] = [
+  { path: '/register', label: '注册', icon: Play },
   { path: '/', label: '总览', icon: LayoutDashboard, exact: true },
   { path: '/history', label: '任务', icon: History },
 ]

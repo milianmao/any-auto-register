@@ -22,6 +22,11 @@ from core.db import AccountModel, TaskEventModel, TaskLog, TaskModel, engine, sa
 from core.platform_accounts import build_platform_account
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
+from services.failed_mailboxes import (
+    classify_failed_mailbox_reason,
+    clear_failed_mailbox,
+    record_failed_mailbox,
+)
 
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK = "account_check"
@@ -124,6 +129,46 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
         if account_id > 0:
             return [f"account:{account_id}"]
     return []
+
+
+def _mailbox_context_from_platform(platform) -> dict[str, str]:
+    identity = getattr(platform, "_last_identity", None)
+    mailbox_account = getattr(identity, "mailbox_account", None) if identity else None
+    mailbox_extra = dict(getattr(mailbox_account, "extra", {}) or {}) if mailbox_account else {}
+    provider_resource = dict(mailbox_extra.get("provider_resource") or {})
+    email = str(getattr(mailbox_account, "email", "") or getattr(identity, "email", "") or "").strip()
+    provider_name = str(
+        provider_resource.get("provider_name")
+        or mailbox_extra.get("mailbox_provider_key")
+        or getattr(getattr(platform, "config", None), "extra", {}).get("mail_provider", "")
+        or ""
+    ).strip()
+    resource_identifier = str(provider_resource.get("resource_identifier") or "").strip()
+    return {
+        "email": email,
+        "provider_name": provider_name,
+        "resource_identifier": resource_identifier,
+    }
+
+
+def _should_record_failed_mailbox(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    negative_markers = (
+        "任务已取消",
+        "cancel",
+        "代理",
+        "proxy",
+        "network",
+        "timeout",
+        "timed out",
+        "浏览器",
+        "browser",
+        "启动失败",
+        "mailbox 初始化失败",
+    )
+    return not any(marker in text for marker in negative_markers)
 
 
 def serialize_task(task: TaskModel) -> dict[str, Any]:
@@ -504,6 +549,7 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     executor_type = str(payload.get("executor_type", "protocol") or "protocol")
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
     extra = dict(payload.get("extra") or {})
+    extra["platform_name"] = platform_name
     config = RegisterConfig(
         executor_type=executor_type,
         captcha_solver=captcha_solver,
@@ -677,6 +723,13 @@ def _auto_followup_chatgpt_payment(
             merged_extra["payment_url"] = pay_result.hosted_url
             account.extra = merged_extra
             save_account(account)
+            mailbox_ctx = _mailbox_context_from_platform(platform)
+            clear_failed_mailbox(
+                provider_name=mailbox_ctx["provider_name"],
+                resource_identifier=mailbox_ctx["resource_identifier"],
+                email=mailbox_ctx["email"] or account.email,
+                platform=platform_name,
+            )
         else:
             error_msg = f"[支付] Plus 支付失败: {pay_result.error}"
             logger.log(error_msg, level="warning")
@@ -848,6 +901,20 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
+            mailbox_ctx = _mailbox_context_from_platform(platform)
+            if mailbox_ctx["email"] and _should_record_failed_mailbox(error):
+                failure_reason, retryable = classify_failed_mailbox_reason(error)
+                record_failed_mailbox(
+                    provider_name=mailbox_ctx["provider_name"],
+                    resource_identifier=mailbox_ctx["resource_identifier"],
+                    email=mailbox_ctx["email"],
+                    platform=platform_name,
+                    failure_stage="register",
+                    failure_reason=failure_reason,
+                    task_id=logger.task_id,
+                    retryable=retryable,
+                    metadata={"raw_error": error},
+                )
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)

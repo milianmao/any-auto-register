@@ -10,6 +10,7 @@ from .models import RegistrationCapability, RegistrationContext, RegistrationArt
 class OtpSpec:
     keyword: str = ""
     timeout: int | None = None
+    resend_after: int | None = None
     code_pattern: str | None = None
     wait_message: str = "等待验证码..."
     success_label: str = "验证码"

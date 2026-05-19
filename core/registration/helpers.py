@@ -48,6 +48,7 @@ def build_otp_callback(
     *,
     keyword: str = "",
     timeout: int | None = None,
+    resend_after: int | None = None,
     code_pattern: str | None = None,
     wait_message: str = "等待验证码...",
     success_label: str = "验证码",
@@ -57,18 +58,45 @@ def build_otp_callback(
     if not mailbox or not mail_acct:
         return None
 
+    resend_state = {"callback": None}
+
     def otp_cb():
         ctx.log(wait_message)
-        kwargs = {"keyword": keyword, "before_ids": getattr(ctx.identity, "before_ids", set())}
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        if code_pattern:
-            kwargs["code_pattern"] = code_pattern
-        code = mailbox.wait_for_code(mail_acct, **kwargs)
+        before_ids = getattr(ctx.identity, "before_ids", set())
+
+        def _wait(wait_timeout: int | None, current_before_ids):
+            kwargs = {"keyword": keyword, "before_ids": current_before_ids}
+            if wait_timeout is not None:
+                kwargs["timeout"] = wait_timeout
+            if code_pattern:
+                kwargs["code_pattern"] = code_pattern
+            return mailbox.wait_for_code(mail_acct, **kwargs)
+
+        if resend_after and resend_after > 0:
+            effective_timeout = timeout if timeout is not None else resend_after
+            first_wait = min(resend_after, effective_timeout)
+            try:
+                code = _wait(first_wait, before_ids)
+            except TimeoutError:
+                resend_callback = resend_state["callback"]
+                if not callable(resend_callback):
+                    raise
+                ctx.log(f"{wait_message} 超过 {first_wait} 秒，尝试重新发送验证码...")
+                resend_callback()
+                before_ids = mailbox.get_current_ids(mail_acct)
+                remaining_timeout = effective_timeout - first_wait
+                second_wait = remaining_timeout if remaining_timeout > 0 else first_wait
+                code = _wait(second_wait, before_ids)
+        else:
+            code = _wait(timeout, before_ids)
         if code:
             ctx.log(f"{success_label}: {code}")
         return code
 
+    def set_resend_callback(callback):
+        resend_state["callback"] = callback
+
+    otp_cb.set_resend_callback = set_resend_callback
     return otp_cb
 
 

@@ -1001,13 +1001,44 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
 
 
 def _start_browser_signup_via_page(page, email: str, log) -> dict:
-    for entry_url in (PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"):
+    home_entry_urls = [f"{CHATGPT_APP}/"]
+    fallback_entry_urls = [PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"]
+
+    for entry_url in home_entry_urls + fallback_entry_urls:
         try:
             log(f"打开 OpenAI 注册入口: {entry_url}")
             page.goto(entry_url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             log(f"注册入口访问失败: {entry_url} -> {exc}")
             continue
+
+        if "chatgpt.com" in entry_url:
+            signup_selector = _click_first(
+                page,
+                [
+                    'a:has-text("Sign up for free")',
+                    'button:has-text("Sign up for free")',
+                    'a:has-text("Sign up")',
+                    'button:has-text("Sign up")',
+                    'a:has-text("Create account")',
+                    'button:has-text("Create account")',
+                    'a:has-text("免费注册")',
+                    'button:has-text("免费注册")',
+                    'a:has-text("注册")',
+                    'button:has-text("注册")',
+                ],
+                timeout=8,
+            )
+            if signup_selector:
+                log(f"首页已点击免费注册按钮: {signup_selector}")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                log("ChatGPT 首页未找到免费注册按钮，回退旧入口")
+                continue
 
         initial_state = _derive_registration_state_from_page(page)
         if initial_state.get("page_type") in {
@@ -1483,6 +1514,56 @@ def _seed_session_cookies(session, cookies_dict: dict):
                 pass
 
 
+def _build_cookie_header(cookies_dict: dict) -> str:
+    parts: list[str] = []
+    for name, value in cookies_dict.items():
+        cookie_name = str(name or "").strip()
+        if not cookie_name:
+            continue
+        parts.append(f"{cookie_name}={value}")
+    return "; ".join(parts)
+
+
+def _fetch_chatgpt_profile(access_token: str, proxy: str | None = None) -> dict:
+    if not access_token:
+        return {}
+    try:
+        response = cffi_requests.get(
+            "https://chatgpt.com/backend-api/me",
+            headers={
+                "authorization": f"Bearer {access_token}",
+                "accept": "application/json",
+                "user-agent": _random_chrome_ua(),
+            },
+            proxies={"http": proxy, "https": proxy} if proxy else None,
+            timeout=20,
+            impersonate="chrome124",
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _derive_account_id(access_token: str, session_data: dict, profile: dict) -> str:
+    payload = _decode_jwt_payload(access_token)
+    auth_claims = payload.get("https://api.openai.com/auth", {}) if isinstance(payload, dict) else {}
+    candidates = [
+        auth_claims.get("chatgpt_account_id", ""),
+        session_data.get("user", {}).get("id", "") if isinstance(session_data.get("user"), dict) else "",
+        session_data.get("account_id", ""),
+        profile.get("id", ""),
+        profile.get("account_id", ""),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _follow_redirects_for_code(session, start_url: str, log, *, max_redirects: int = 12) -> str:
     current_url = start_url
     for idx in range(max_redirects):
@@ -1779,6 +1860,8 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 if not otp_callback:
                     log("  ⚠️ OAuth 需要邮箱 OTP 但没有 otp_callback")
                     return None
+                if hasattr(otp_callback, "set_resend_callback"):
+                    otp_callback.set_resend_callback(lambda: _request_openai_email_otp_resend(page, log))
                 log("  OAuth 等待邮箱验证码...")
                 code = otp_callback()
                 if not code:
@@ -2009,6 +2092,25 @@ def _is_password_registration(state: dict) -> bool:
 def _is_email_otp(state: dict) -> bool:
     target = f"{state.get('continue_url') or ''} {state.get('current_url') or ''}".lower()
     return str(state.get("page_type") or "") == "email_otp_verification" or "email-verification" in target or "email-otp" in target
+
+
+def _request_openai_email_otp_resend(page, log) -> bool:
+    resend_clicked = _click_first(page, [
+        'button:has-text("Resend")',
+        'button:has-text("resend")',
+        'button:has-text("Resend code")',
+        'button:has-text("Send code again")',
+        'button:has-text("重新发送")',
+        'a:has-text("Resend")',
+        'a:has-text("resend")',
+        'a:has-text("Resend code")',
+        'a:has-text("Send code again")',
+    ], timeout=3)
+    if resend_clicked:
+        log(f"  email-otp/resend -> 已点击页面 Resend 按钮: {resend_clicked}")
+        return True
+    log("  email-otp/resend -> 页面未找到 Resend 按钮，跳过")
+    return False
 
 
 def _is_about_you(state: dict) -> bool:
@@ -2942,18 +3044,25 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         ]
         for candidate in otp_candidates:
             try:
-                target = candidate.first
-                target.wait_for(state="visible", timeout=1200)
-                target.click(timeout=1200)
-                target.fill("")
-                target.type(otp, delay=random.randint(18, 45))
-                final_value = str(target.input_value() or "").strip()
-                if final_value:
-                    filled = True
-                    log("验证码页已填写单输入框")
-                    break
+                count = int(candidate.count())
             except Exception:
                 continue
+            for i in range(count):
+                try:
+                    target = candidate.nth(i)
+                    target.wait_for(state="visible", timeout=1200)
+                    target.click(timeout=1200)
+                    target.fill("")
+                    target.type(otp, delay=random.randint(18, 45))
+                    final_value = str(target.input_value() or "").strip()
+                    if final_value:
+                        filled = True
+                        log("验证码页已填写单输入框")
+                        break
+                except Exception:
+                    continue
+            if filled:
+                break
 
     if not filled:
         # 再等 3 秒重试一次（页面可能还在渲染）
@@ -2966,17 +3075,25 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         ]
         for sel in otp_retry_selectors:
             try:
-                target = page.locator(sel).first
-                if target.is_visible(timeout=2000):
-                    target.click(timeout=1500)
-                    target.fill("")
-                    target.type(otp, delay=random.randint(18, 45))
-                    if str(target.input_value() or "").strip():
-                        filled = True
-                        log("验证码页已填写单输入框(重试)")
-                        break
+                locator = page.locator(sel)
+                count = int(locator.count())
             except Exception:
                 continue
+            for i in range(count):
+                try:
+                    target = locator.nth(i)
+                    if target.is_visible(timeout=2000):
+                        target.click(timeout=1500)
+                        target.fill("")
+                        target.type(otp, delay=random.randint(18, 45))
+                        if str(target.input_value() or "").strip():
+                            filled = True
+                            log("验证码页已填写单输入框(重试)")
+                            break
+                except Exception:
+                    continue
+            if filled:
+                break
 
     if not filled:
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
@@ -3758,6 +3875,8 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
         if _is_email_otp(state):
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
+            if hasattr(otp_callback, "set_resend_callback"):
+                otp_callback.set_resend_callback(lambda: _request_openai_email_otp_resend(page, log))
             log("等待 ChatGPT 验证码")
             code = otp_callback()
             if not code:
@@ -3837,12 +3956,14 @@ class ChatGPTBrowserRegister:
         otp_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
         log_fn: Callable[[str], None] = print,
+        keep_browser_open_on_failure: bool = False,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
         self.phone_callback = phone_callback
         self.log = log_fn
+        self.keep_browser_open_on_failure = keep_browser_open_on_failure
 
     def run(self, email: str, password: str) -> dict:
         proxy = _build_proxy_config(self.proxy)
@@ -3851,7 +3972,10 @@ class ChatGPTBrowserRegister:
             launch_opts["proxy"] = proxy
             launch_opts["geoip"] = True
 
-        with Camoufox(**launch_opts) as browser:
+        browser_cm = Camoufox(**launch_opts)
+        browser = browser_cm.__enter__()
+        keep_open = False
+        try:
             page = browser.new_page()
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
@@ -3864,29 +3988,114 @@ class ChatGPTBrowserRegister:
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 获取 session token 和 cookies
-            cookies_dict = _get_cookies(page)
+            self.log("注册成功，开始从当前浏览器会话读取 ChatGPT session...")
+            session_result = self._collect_registered_session(page, email, password)
+            if session_result:
+                self.log(f"浏览器 session 获取成功: account_id={session_result.get('account_id', '')}")
+                return session_result
+            raise RuntimeError("ChatGPT 注册成功，但当前浏览器新标签页未获取到 session")
+        except Exception:
+            keep_open = self.keep_browser_open_on_failure and not self.headless
+            if keep_open:
+                self.log("注册失败，按配置保留当前浏览器窗口以便排查")
+            raise
+        finally:
+            if keep_open:
+                self._retained_browser_cm = browser_cm
+                self._retained_browser = browser
+            else:
+                browser_cm.__exit__(None, None, None)
 
-            # ═══ 通过 Codex CLI OAuth 获取正确的 token ═══
-            # 注册完成后的浏览器上下文 session 状态不稳定（NS_BINDING_ABORTED），
-            # 直接用全新浏览器做 OAuth 更可靠
-            self.log("执行 Codex CLI OAuth 流程获取 token...")
+    def _collect_registered_session(self, page, email: str, password: str) -> dict | None:
+        self.log("  等待 30 秒让 ChatGPT 会话 cookie 落地...")
+        time.sleep(30)
+        cookies_dict = _get_cookies(page)
+        session_token = str(cookies_dict.get("__Secure-next-auth.session-token") or "").strip()
+        if not session_token:
+            self.log("  当前浏览器会话缺少 __Secure-next-auth.session-token")
+            return None
 
-        # 直接用全新浏览器做 OAuth（注册后的浏览器上下文不可靠）
-        codex_result = self._retry_oauth_fresh_browser(email, password)
-        if codex_result:
-            self.log(f"全新浏览器 OAuth 成功: account_id={codex_result.get('account_id','')}")
-            return {
-                "email": email, "password": password,
-                "account_id": codex_result.get("account_id", ""),
-                "access_token": codex_result.get("access_token", ""),
-                "refresh_token": codex_result.get("refresh_token", ""),
-                "id_token": codex_result.get("id_token", ""),
-                "session_token": "", "workspace_id": "",
-                "cookies": "", "profile": {},
-            }
+        session_page = None
+        try:
+            session_page = page.context.new_page()
+            response = session_page.goto(
+                "https://chatgpt.com/api/auth/session",
+                wait_until="domcontentloaded",
+                timeout=30,
+            )
+        except Exception as exc:
+            self.log(f"  读取 ChatGPT session 异常: {exc}")
+            return None
 
-        raise RuntimeError("ChatGPT 注册未完成完整 OAuth callback，已拒绝回退到 session/access_token 半成品结果")
+        status_code = int(getattr(response, "status", 0) or 0)
+        if status_code != 200:
+            self.log(f"  读取 ChatGPT session 失败: HTTP {status_code}")
+            if session_page:
+                try:
+                    session_page.close()
+                except Exception:
+                    pass
+            return None
+
+        try:
+            body_text = response.text() or ""
+            session_data = json.loads(body_text) if body_text else {}
+        except Exception as exc:
+            self.log(f"  解析 ChatGPT session JSON 失败: {exc}")
+            if session_page:
+                try:
+                    session_page.close()
+                except Exception:
+                    pass
+            return None
+        if not isinstance(session_data, dict):
+            self.log("  ChatGPT session 返回不是对象")
+            if session_page:
+                try:
+                    session_page.close()
+                except Exception:
+                    pass
+            return None
+
+        access_token = str(session_data.get("accessToken") or "").strip()
+        if not access_token:
+            self.log("  ChatGPT session 未返回 accessToken")
+            if session_page:
+                try:
+                    session_page.close()
+                except Exception:
+                    pass
+            return None
+
+        refreshed_cookies = _get_cookies(session_page)
+        refreshed_session_token = str(refreshed_cookies.get("__Secure-next-auth.session-token") or session_token).strip()
+        if refreshed_session_token:
+            cookies_dict["__Secure-next-auth.session-token"] = refreshed_session_token
+        for cookie_name, cookie_value in refreshed_cookies.items():
+            cookies_dict[cookie_name] = cookie_value
+        profile = _fetch_chatgpt_profile(access_token, proxy=self.proxy)
+        account_id = _derive_account_id(access_token, session_data, profile)
+        session_user = session_data.get("user") if isinstance(session_data.get("user"), dict) else {}
+        resolved_email = str(session_user.get("email") or "").strip() or str(profile.get("email") or "").strip() or email
+        if session_page:
+            try:
+                session_page.close()
+            except Exception:
+                pass
+
+        return {
+            "email": resolved_email,
+            "password": password,
+            "account_id": account_id,
+            "access_token": access_token,
+            "refresh_token": "",
+            "id_token": access_token,
+            "session_token": refreshed_session_token,
+            "workspace_id": "",
+            "cookies": _build_cookie_header(cookies_dict),
+            "profile": profile or session_user or {},
+            "session_payload": session_data,
+        }
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""

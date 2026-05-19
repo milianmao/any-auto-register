@@ -129,26 +129,49 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         email = _safe_text(padded[0])
         if "@" not in email:
             continue
+        is_graph_short_form = (
+            len(parts) == 4
+            and "@" in _safe_text(parts[0])
+            and bool(_safe_text(parts[2]))
+            and bool(_safe_text(parts[3]))
+        )
+        login_account = email if is_graph_short_form else (_safe_text(padded[2]) or email)
+        imap_host = "" if is_graph_short_form else _safe_text(padded[3])
+        imap_port = "" if is_graph_short_form else _safe_text(padded[4])
+        imap_account_type = "" if is_graph_short_form else _safe_text(padded[5])
+        imap_security = "" if is_graph_short_form else _safe_text(padded[6])
+        smtp_host = "" if is_graph_short_form else _safe_text(padded[7])
+        smtp_port = "" if is_graph_short_form else _safe_text(padded[8])
+        smtp_security = "" if is_graph_short_form else _safe_text(padded[9])
+        note = "" if is_graph_short_form else _safe_text(padded[10])
+        proxy_mode = "" if is_graph_short_form else _safe_text(padded[11])
+        proxy = "" if is_graph_short_form else _safe_text(padded[12])
+        label = "" if is_graph_short_form else _safe_text(padded[13])
+        recovery_email = "" if is_graph_short_form else _safe_text(padded[14])
+        recovery_password = "" if is_graph_short_form else _safe_text(padded[15])
+        client_id = _safe_text(parts[2]) if is_graph_short_form else _safe_text(padded[16])
+        refresh_token = _safe_text(parts[3]) if is_graph_short_form else _safe_text(padded[17])
+        totp_secret = "" if is_graph_short_form else _safe_text(padded[18])
         entry = LocalMicrosoftMailboxEntry(
             email=email,
             password=_safe_text(padded[1]),
-            login_account=_safe_text(padded[2]) or email,
-            imap_host=_safe_text(padded[3]),
-            imap_port=_safe_text(padded[4]),
-            imap_account_type=_safe_text(padded[5]),
-            imap_security=_safe_text(padded[6]),
-            smtp_host=_safe_text(padded[7]),
-            smtp_port=_safe_text(padded[8]),
-            smtp_security=_safe_text(padded[9]),
-            note=_safe_text(padded[10]),
-            proxy_mode=_safe_text(padded[11]),
-            proxy=_safe_text(padded[12]),
-            label=_safe_text(padded[13]),
-            recovery_email=_safe_text(padded[14]),
-            recovery_password=_safe_text(padded[15]),
-            client_id=_safe_text(padded[16]),
-            refresh_token=_safe_text(padded[17]),
-            totp_secret=_safe_text(padded[18]),
+            login_account=login_account,
+            imap_host=imap_host,
+            imap_port=imap_port,
+            imap_account_type=imap_account_type,
+            imap_security=imap_security,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_security=smtp_security,
+            note=note,
+            proxy_mode=proxy_mode,
+            proxy=proxy,
+            label=label,
+            recovery_email=recovery_email,
+            recovery_password=recovery_password,
+            client_id=client_id,
+            refresh_token=refresh_token,
+            totp_secret=totp_secret,
             raw=line,
         )
         if entry.key in seen:

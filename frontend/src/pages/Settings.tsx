@@ -342,6 +342,49 @@ function Field({ field, form, setForm, showSecret, setShowSecret, selectOptions 
 
 function ProviderField({ field, value, onChange, showSecret, setShowSecret, secretKey, disabled = false }: any) {
   const { label, placeholder, secret, type, options } = field
+  const [asyncOptions, setAsyncOptions] = useState<Array<{ value: string; label: string }>>([])
+  const [asyncLoading, setAsyncLoading] = useState(false)
+
+  useEffect(() => {
+    if (type !== 'async-select' || !field.asyncUrl) {
+      return
+    }
+    let cancelled = false
+    setAsyncLoading(true)
+    apiFetch(field.asyncUrl)
+      .then((data: any) => {
+        if (cancelled) return
+        const valueKey = field.asyncValueKey || 'value'
+        const labelKey = field.asyncLabelKey || 'label'
+        let items: any[] = []
+        if (Array.isArray(data)) items = data
+        else if (data?.countries) items = data.countries
+        else if (data?.services) items = data.services
+        else if (Array.isArray(data?.data)) items = data.data
+
+        const nextOptions = items.map((item: any) => {
+          if (typeof item === 'object') {
+            const nextValue = String(item[valueKey] ?? item.id ?? item.country ?? '')
+            const nextLabel = String(item[labelKey] ?? item.name ?? item.title ?? item.eng ?? nextValue)
+            return { value: nextValue, label: nextLabel ? `${nextLabel} (${nextValue})` : nextValue }
+          }
+          return { value: String(item), label: String(item) }
+        }).filter(option => option.value)
+
+        setAsyncOptions(nextOptions)
+      })
+      .catch(() => {
+        if (!cancelled) setAsyncOptions([])
+      })
+      .finally(() => {
+        if (!cancelled) setAsyncLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [field.asyncLabelKey, field.asyncUrl, field.asyncValueKey, type])
+
   return (
     <div className="grid grid-cols-3 gap-4 items-center py-3 border-b border-white/5 last:border-0">
       <label className="text-sm text-[var(--text-secondary)] font-medium">{label}</label>
@@ -355,6 +398,20 @@ function ProviderField({ field, value, onChange, showSecret, setShowSecret, secr
           >
             {options.map((o: any) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
+        ) : type === 'async-select' ? (
+          asyncLoading ? (
+            <div className="control-surface text-sm text-[var(--text-muted)] py-2">加载中...</div>
+          ) : (
+            <select
+              value={value || ''}
+              onChange={e => onChange(e.target.value)}
+              disabled={disabled}
+              className="control-surface appearance-none disabled:opacity-70"
+            >
+              <option value="">{placeholder || '请选择...'}</option>
+              {asyncOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          )
         ) : type === 'textarea' ? (
           <textarea
             value={value || ''}

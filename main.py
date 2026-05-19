@@ -142,4 +142,4 @@ if __name__ == "__main__":
         solver_main()
         sys.exit(0)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8003)

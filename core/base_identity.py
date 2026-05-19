@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from services.failed_mailboxes import is_mailbox_blocked
+
 
 IDENTITY_PROVIDER_ALIASES = {
     "": "mailbox",
@@ -81,7 +83,33 @@ class MailboxIdentityProvider(BaseIdentityProvider):
         if not self.mailbox:
             return IdentityMaterial(identity_provider=self.identity_provider, email=requested_email)
 
-        mail_acct = self.mailbox.get_email()
+        platform_name = str(self.extra.get("platform_name", "") or "").strip()
+        mail_acct = None
+        last_block_reason = ""
+        for _ in range(5):
+            candidate = self.mailbox.get_email()
+            email = getattr(candidate, "email", "") or ""
+            provider_resource = dict(getattr(candidate, "extra", {}) or {}).get("provider_resource") or {}
+            provider_name = str(
+                provider_resource.get("provider_name")
+                or getattr(candidate, "extra", {}).get("mailbox_provider_key", "")
+                or self.extra.get("mail_provider", "")
+                or ""
+            ).strip()
+            resource_identifier = str(provider_resource.get("resource_identifier") or "").strip()
+            blocked, reason = is_mailbox_blocked(
+                provider_name=provider_name,
+                resource_identifier=resource_identifier,
+                email=email,
+                platform=platform_name,
+            )
+            if not blocked:
+                mail_acct = candidate
+                break
+            last_block_reason = reason
+        if mail_acct is None:
+            raise ValueError(f"当前 mailbox provider 未获取到可用邮箱，最近一次命中失败标记原因: {last_block_reason or 'blocked'}")
+
         email = getattr(mail_acct, "email", "") or ""
         if not requested_email and not email:
             provider_name = getattr(self.mailbox, "__class__", type(self.mailbox)).__name__

@@ -1224,6 +1224,7 @@ class RegistrationEngine:
         result = RegistrationResult(success=False, logs=self.logs)
 
         try:
+            self._log(f"注册代理 proxy_url: {self.proxy_url or '<empty>'}")
             self._log("=" * 60)
             self._log("开始注册流程")
             self._log("=" * 60)
