@@ -83,6 +83,23 @@ SIGNUP_RECOVERY_SELECTORS = [
     'button:has-text("注册")',
 ]
 
+CHATGPT_HOME_SIGNUP_SELECTORS = [
+    'a[href*="auth.openai.com"][href*="screen_hint=signup"]',
+    'a[href*="/api/auth/signin/openai"]',
+    'button:has-text("Sign up")',
+    'button:has-text("sign up")',
+    'button:has-text("Get started")',
+    'button:has-text("get started")',
+    'button:has-text("Try for free")',
+    'button:has-text("try for free")',
+    'button:has-text("免费注册")',
+    'button:has-text("注册")',
+    'a:has-text("Sign up")',
+    'a:has-text("sign up")',
+    'a:has-text("免费注册")',
+    'a:has-text("注册")',
+]
+
 PASSWORDLESS_LOGIN_SELECTORS = [
     'button[name="intent"][value="passwordless_login_send_otp"]',
     'button[value="passwordless_login_send_otp"]',
@@ -570,6 +587,251 @@ def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None
         return None
 
 
+def _wait_for_manual_submit_transition(
+    page,
+    log,
+    *,
+    selectors: list[str],
+    description: str,
+    success_predicate,
+    error_message: str,
+    timeout: int = 300,
+):
+    submit_selector = _wait_for_any_selector(page, selectors, timeout=8)
+    if not submit_selector:
+        raise RuntimeError(f"{description}未找到可手动点击的提交按钮")
+    log(f"{description}已就绪，请手动点击继续按钮: {submit_selector}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = success_predicate()
+        if result:
+            return result
+        error_text = _extract_auth_error_text(page)
+        if error_text:
+            raise RuntimeError(f"{description}{error_text[:300]}")
+        time.sleep(0.25)
+    raise RuntimeError(error_message)
+
+
+def _is_manual_step_mode(page) -> bool:
+    return bool(getattr(page, "_codex_manual_step_mode", False))
+
+
+def _handle_cookie_consent(page, log, *, timeout: int = 3) -> bool:
+    selectors = [
+        'button:has-text("Accept")',
+        'button:has-text("accept")',
+        'button:has-text("Accept all")',
+        'button:has-text("accept all")',
+        'button:has-text("Allow all")',
+        'button:has-text("allow all")',
+        'button:has-text("Agree")',
+        'button:has-text("agree")',
+        'button:has-text("I agree")',
+        'button:has-text("我同意")',
+        'button:has-text("同意")',
+        'button:has-text("接受")',
+        'button:has-text("全部接受")',
+        '[aria-label*="Accept" i]',
+        '[data-testid*="cookie" i] button',
+    ]
+    clicked = _click_first(page, selectors, timeout=timeout)
+    if clicked:
+        log(f"已处理 Cookie 授权: {clicked}")
+        _browser_pause(page)
+        return True
+    return False
+
+
+def _click_chatgpt_home_signup(page, log, *, timeout: int = 8) -> bool:
+    _handle_cookie_consent(page, log, timeout=2)
+    selector = _click_first(page, CHATGPT_HOME_SIGNUP_SELECTORS, timeout=timeout)
+    if selector:
+        log(f"已点击 ChatGPT 首页注册入口: {selector}")
+        return True
+    try:
+        clicked = bool(
+            page.evaluate(
+                """
+                () => {
+                  const nodes = Array.from(document.querySelectorAll('a,button,[role="button"]'));
+                  const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                  };
+                  const target = nodes.find((el) => {
+                    const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    return visible(el) && /sign up|get started|try for free|免费注册|注册/i.test(text);
+                  });
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }
+                """
+            )
+        )
+    except Exception:
+        clicked = False
+    if clicked:
+        log("已通过页面文本匹配点击 ChatGPT 首页注册入口")
+        return True
+    return False
+
+
+def _wait_for_oauth_email_submit_manual(page, log, start_url: str, timeout: int = 300) -> dict:
+    def _success():
+        current_url = str(page.url or "")
+        if _click_passwordless_login_if_available(page, log, context="manual_oauth_email_submit"):
+            time.sleep(0.5)
+            return None
+        state = _derive_oauth_state_from_page(page)
+        page_type = str(state.get("page_type") or "")
+        if page_type in {
+            "login_password",
+            "create_account_password",
+            "email_otp_verification",
+            "about_you",
+            "consent",
+            "workspace_selection",
+            "organization_selection",
+            "add_phone",
+            "external_url",
+            "oauth_callback",
+            "chatgpt_home",
+        }:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if current_url != start_url and page_type != "login_email":
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        return None
+
+    return _wait_for_manual_submit_transition(
+        page,
+        log,
+        selectors=EMAIL_SUBMIT_SELECTORS,
+        description="OAuth email step: ",
+        success_predicate=_success,
+        error_message="OAuth email step manual submit timed out before the flow advanced",
+        timeout=timeout,
+    )
+
+
+def _wait_for_password_submit_manual(page, log, start_url: str, timeout: int = 300) -> dict:
+    def _success():
+        current_url = str(page.url or "")
+        state = _derive_registration_state_from_page(page)
+        page_type = str(state.get("page_type") or "")
+        if page_type in {"email_otp_verification", "about_you", "add_phone", "oauth_callback", "chatgpt_home"}:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if current_url != start_url and page_type and page_type not in {"create_account_password", "login_password"}:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if page_type == "login_password" and _recover_signup_password_page(page, log):
+            return None
+        return None
+
+    return _wait_for_manual_submit_transition(
+        page,
+        log,
+        selectors=PASSWORD_SUBMIT_SELECTORS,
+        description="Password step: ",
+        success_predicate=_success,
+        error_message="Password step manual submit timed out before the flow advanced",
+        timeout=timeout,
+    )
+
+
+def _wait_for_oauth_password_submit_manual(page, log, timeout: int = 300) -> dict:
+    def _success():
+        current_url = str(page.url or "")
+        state = _derive_registration_state_from_page(page)
+        page_type = str(state.get("page_type") or "")
+        if page_type in {
+            "email_otp_verification",
+            "about_you",
+            "consent",
+            "workspace_selection",
+            "organization_selection",
+            "add_phone",
+            "oauth_callback",
+            "chatgpt_home",
+            "external_url",
+        }:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if "code=" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        return None
+
+    return _wait_for_manual_submit_transition(
+        page,
+        log,
+        selectors=PASSWORD_SUBMIT_SELECTORS,
+        description="OAuth password step: ",
+        success_predicate=_success,
+        error_message="OAuth password step manual submit timed out before the flow advanced",
+        timeout=timeout,
+    )
+
+
+def _wait_for_otp_submit_manual(page, log, timeout: int = 300) -> dict:
+    def _success():
+        current_url = str(page.url or "")
+        if "about-you" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if "add-phone" in current_url or "chatgpt.com" in current_url or "code=" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        return None
+
+    return _wait_for_manual_submit_transition(
+        page,
+        log,
+        selectors=[
+            'button[type="submit"]',
+            'button[data-testid="continue-button"]',
+            'button:has-text("Continue")',
+            'button:has-text("continue")',
+            'button:has-text("Verify")',
+            'button:has-text("verify")',
+            'button:has-text("Next")',
+            'button:has-text("next")',
+        ],
+        description="OTP step: ",
+        success_predicate=_success,
+        error_message="OTP step manual submit timed out before the flow advanced",
+        timeout=timeout,
+    )
+
+
+def _wait_for_about_you_submit_manual(page, log, timeout: int = 300) -> dict:
+    def _success():
+        current_url = str(page.url or "")
+        if "code=" in current_url or "chatgpt.com" in current_url or "sign-in-with-chatgpt" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if "add-phone" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        return None
+
+    return _wait_for_manual_submit_transition(
+        page,
+        log,
+        selectors=[
+            'button:has-text("Finish creating account")',
+            'button:has-text("finish creating account")',
+            'button[type="submit"]',
+            'button[data-testid="continue-button"]',
+            'button:has-text("Continue")',
+            'button:has-text("continue")',
+            'button:has-text("Next")',
+            'button:has-text("next")',
+        ],
+        description="About you step: ",
+        success_predicate=_success,
+        error_message="About you step manual submit timed out before the flow advanced",
+        timeout=timeout,
+    )
+
+
 def _is_login_password_url(url: str) -> bool:
     return bool(re.search(r"(?:auth|accounts)\.openai\.com/.*log-?in/password", str(url or ""), flags=re.I))
 
@@ -1000,11 +1262,39 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
     raise RuntimeError("邮箱页提交后未进入密码/验证码页面")
 
 
-def _start_browser_signup_via_page(page, email: str, log) -> dict:
-    home_entry_urls = [f"{CHATGPT_APP}/"]
-    fallback_entry_urls = [PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"]
+def _wait_for_signup_entry_transition_manual(page, log, timeout: int = 300) -> dict:
+    def _success():
+        if _click_passwordless_login_if_available(page, log, context="manual_email_submit"):
+            time.sleep(0.5)
+            return None
+        state = _derive_registration_state_from_page(page)
+        if state.get("page_type") in {
+            "create_account_password",
+            "login_password",
+            "email_otp_verification",
+            "about_you",
+            "add_phone",
+            "chatgpt_home",
+            "oauth_callback",
+        }:
+            if state.get("page_type") == "login_password" and _recover_signup_password_page(page, log):
+                return _derive_registration_state_from_page(page)
+            return state
+        return None
 
-    for entry_url in home_entry_urls + fallback_entry_urls:
+    return _wait_for_manual_submit_transition(
+        page,
+        log,
+        selectors=EMAIL_SUBMIT_SELECTORS,
+        description="Email step: ",
+        success_predicate=_success,
+        error_message="Email step manual submit timed out before the flow advanced",
+        timeout=timeout,
+    )
+
+
+def _start_browser_signup_via_page(page, email: str, log, *, manual_step_mode: bool = False) -> dict:
+    for entry_url in (PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"):
         try:
             log(f"打开 OpenAI 注册入口: {entry_url}")
             page.goto(entry_url, wait_until="domcontentloaded", timeout=30000)
@@ -1012,33 +1302,28 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
             log(f"注册入口访问失败: {entry_url} -> {exc}")
             continue
 
-        if "chatgpt.com" in entry_url:
-            signup_selector = _click_first(
-                page,
-                [
-                    'a:has-text("Sign up for free")',
-                    'button:has-text("Sign up for free")',
-                    'a:has-text("Sign up")',
-                    'button:has-text("Sign up")',
-                    'a:has-text("Create account")',
-                    'button:has-text("Create account")',
-                    'a:has-text("免费注册")',
-                    'button:has-text("免费注册")',
-                    'a:has-text("注册")',
-                    'button:has-text("注册")',
-                ],
-                timeout=8,
-            )
-            if signup_selector:
-                log(f"首页已点击免费注册按钮: {signup_selector}")
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=5000)
-                except Exception:
-                    pass
-                time.sleep(0.5)
-            else:
-                log("ChatGPT 首页未找到免费注册按钮，回退旧入口")
-                continue
+        _handle_cookie_consent(page, log, timeout=2)
+
+        if entry_url.startswith(CHATGPT_APP):
+            if _click_chatgpt_home_signup(page, log, timeout=8):
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    _handle_cookie_consent(page, log, timeout=1)
+                    initial_state = _derive_registration_state_from_page(page)
+                    if initial_state.get("page_type") in {
+                        "create_account_password",
+                        "login_password",
+                        "email_otp_verification",
+                        "about_you",
+                        "add_phone",
+                    }:
+                        return initial_state
+                    if _wait_for_any_selector(page, EMAIL_INPUT_SELECTORS, timeout=1):
+                        break
+                    current_url = str(page.url or "")
+                    if "auth.openai.com" in current_url or "chatgpt.com/auth" in current_url:
+                        break
+                    time.sleep(0.25)
 
         initial_state = _derive_registration_state_from_page(page)
         if initial_state.get("page_type") in {
@@ -1062,6 +1347,9 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
             if inline_state.get("page_type") == "login_password" and _recover_signup_password_page(page, log):
                 return _derive_registration_state_from_page(page)
             return inline_state
+
+        if manual_step_mode:
+            return _wait_for_signup_entry_transition_manual(page, log)
 
         submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
         if submit_selector:
@@ -1740,6 +2028,9 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     _browser_pause(page)
 
     start_url = str(page.url or "")
+    if _is_manual_step_mode(page):
+        return _wait_for_oauth_email_submit_manual(page, log, start_url)
+
     submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"OAuth 邮箱页已点击继续按钮: {submit_selector}")
@@ -2048,6 +2339,10 @@ def _handle_post_signup_onboarding(page, log) -> None:
     current_url = str(page.url or "")
     if "chatgpt.com" not in current_url:
         return
+    try:
+        _handle_cookie_consent(page, log, timeout=1)
+    except Exception:
+        pass
     try:
         # 可能弹出 persistent storage 提示，优先点 Allow，不影响主流程也可点 Block。
         allow_selector = _click_first(
@@ -2358,13 +2653,31 @@ def _do_add_phone_attempt(
     _browser_pause(page)
 
     # ---- 第4步: 点击发送按钮 ----
-    send_sel = _click_first(page, PHONE_SEND_SELECTORS, timeout=8)
-    if send_sel:
-        log(f"  已点击发送按钮: {send_sel}")
-    elif _submit_form_with_fallback(page, phone_input_sel):
-        log("  未找到发送按钮，已使用表单 fallback 提交")
+    if _is_manual_step_mode(page):
+        def _success():
+            current_url = str(page.url or "")
+            if _find_first_selector(page, OTP_INPUT_SELECTORS):
+                return True
+            if current_url != referer and current_url:
+                return True
+            return None
+
+        _wait_for_manual_submit_transition(
+            page,
+            log,
+            selectors=PHONE_SEND_SELECTORS,
+            description="Phone send step: ",
+            success_predicate=_success,
+            error_message="Phone send step manual submit timed out before the flow advanced",
+        )
     else:
-        raise RuntimeError("未找到发送验证码按钮")
+        send_sel = _click_first(page, PHONE_SEND_SELECTORS, timeout=8)
+        if send_sel:
+            log(f"  已点击发送按钮: {send_sel}")
+        elif _submit_form_with_fallback(page, phone_input_sel):
+            log("  未找到发送按钮，已使用表单 fallback 提交")
+        else:
+            raise RuntimeError("未找到发送验证码按钮")
 
     # 等待页面响应（可能显示 OTP 输入框或错误）
     time.sleep(2)
@@ -2910,6 +3223,9 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
     log(f"  OAuth 密码页输入框: {input_selector}")
     _browser_pause(page)
 
+    if _is_manual_step_mode(page):
+        return _wait_for_oauth_password_submit_manual(page, log)
+
     submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"  OAuth 密码页已点击继续按钮: {submit_selector}")
@@ -2948,6 +3264,9 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     _browser_pause(page)
 
     start_url = str(page.url or "")
+    if _is_manual_step_mode(page):
+        return _wait_for_password_submit_manual(page, log, start_url)
+
     submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"密码页已点击继续按钮: {submit_selector}")
@@ -3099,6 +3418,9 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
+    if _is_manual_step_mode(page):
+        return _wait_for_otp_submit_manual(page, log)
+
     submit_selector = _click_first(
         page,
         [
@@ -3687,6 +4009,9 @@ def _submit_about_you_via_page(page, log) -> dict:
         raise RuntimeError("about_you 未成功填写 Birthday/Age")
     _browser_pause(page)
 
+    if _is_manual_step_mode(page):
+        return _wait_for_about_you_submit_manual(page, log)
+
     submit_selector = _click_first(
         page,
         [
@@ -3802,8 +4127,9 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
         user_agent = _random_chrome_ua()
 
     _seed_browser_device_id(page, device_id)
+    manual_step_mode = _is_manual_step_mode(page)
     try:
-        state = _start_browser_signup_via_page(page, email, log)
+        state = _start_browser_signup_via_page(page, email, log, manual_step_mode=manual_step_mode)
     except Exception as exc:
         log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
         state = _start_browser_signup_via_authorize(page, email, device_id, log)
@@ -3957,6 +4283,7 @@ class ChatGPTBrowserRegister:
         phone_callback: Optional[Callable[[], str]] = None,
         log_fn: Callable[[str], None] = print,
         keep_browser_open_on_failure: bool = False,
+        manual_step_mode: bool = False,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -3964,6 +4291,7 @@ class ChatGPTBrowserRegister:
         self.phone_callback = phone_callback
         self.log = log_fn
         self.keep_browser_open_on_failure = keep_browser_open_on_failure
+        self.manual_step_mode = manual_step_mode
 
     def run(self, email: str, password: str) -> dict:
         proxy = _build_proxy_config(self.proxy)
@@ -3977,6 +4305,7 @@ class ChatGPTBrowserRegister:
         keep_open = False
         try:
             page = browser.new_page()
+            page._codex_manual_step_mode = self.manual_step_mode
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
                 page,
@@ -4008,7 +4337,7 @@ class ChatGPTBrowserRegister:
 
     def _collect_registered_session(self, page, email: str, password: str) -> dict | None:
         self.log("  等待 30 秒让 ChatGPT 会话 cookie 落地...")
-        time.sleep(30)
+        time.sleep(5)
         cookies_dict = _get_cookies(page)
         session_token = str(cookies_dict.get("__Secure-next-auth.session-token") or "").strip()
         if not session_token:
@@ -4094,7 +4423,6 @@ class ChatGPTBrowserRegister:
             "workspace_id": "",
             "cookies": _build_cookie_header(cookies_dict),
             "profile": profile or session_user or {},
-            "session_payload": session_data,
         }
 
     def _retry_oauth_fresh_browser(self, email, password):

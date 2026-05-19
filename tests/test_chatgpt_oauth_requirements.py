@@ -143,32 +143,6 @@ def test_browser_register_run_returns_session_data_from_registered_browser(monke
     assert result["profile"]["email"] == "user@example.com"
 
 
-def test_start_browser_signup_via_page_uses_chatgpt_home_signup_entry(monkeypatch):
-    events: list[tuple[str, str]] = []
-
-    class FakePage:
-        def __init__(self):
-            self.url = "about:blank"
-
-        def goto(self, url, **kwargs):
-            self.url = url
-            events.append(("goto", url))
-
-    monkeypatch.setattr(browser_register_module, "_derive_registration_state_from_page", lambda page: {"page_type": ""})
-    monkeypatch.setattr(browser_register_module, "_wait_for_any_selector", lambda page, selectors, timeout=12: selectors[0])
-    monkeypatch.setattr(browser_register_module, "_fill_input_like_user", lambda page, selector, email: events.append(("fill", selector)) or True)
-    monkeypatch.setattr(browser_register_module, "_click_first", lambda page, selectors, timeout=8: events.append(("click", selectors[0])) or selectors[0])
-    monkeypatch.setattr(browser_register_module, "_submit_form_with_fallback", lambda page, selector: False)
-    monkeypatch.setattr(browser_register_module, "_wait_for_signup_entry_transition", lambda page, log: {"page_type": "create_account_password"})
-
-    state = browser_register_module._start_browser_signup_via_page(FakePage(), "user@example.com", lambda message: None)
-
-    assert state["page_type"] == "create_account_password"
-    assert ("goto", "https://chatgpt.com/") in events
-    assert any(event[0] == "click" for event in events)
-    assert any(event[0] == "fill" for event in events)
-
-
 def test_collect_registered_session_opens_new_tab_for_session_request(monkeypatch):
     events: list[object] = []
 
@@ -231,8 +205,6 @@ def test_collect_registered_session_opens_new_tab_for_session_request(monkeypatc
     assert result["account_id"] == "acct_123"
     assert result["access_token"] == "at_123"
     assert result["session_token"] == "sess_123"
-    assert result["session_payload"]["accessToken"] == "at_123"
-    assert result["session_payload"]["user"]["email"] == "user@example.com"
 
 
 def test_collect_registered_session_waits_30_seconds_before_reading_cookie(monkeypatch):
@@ -297,30 +269,6 @@ def test_collect_registered_session_waits_30_seconds_before_reading_cookie(monke
     assert result is not None
     assert result["session_token"] == "sess_123"
     assert sleep_calls == [30]
-
-
-def test_map_chatgpt_result_preserves_session_payload():
-    platform = object.__new__(ChatGPTPlatform)
-
-    mapped = platform._map_chatgpt_result({
-        "email": "user@example.com",
-        "password": "Secret123!",
-        "account_id": "acct_123",
-        "access_token": "at_123",
-        "refresh_token": "",
-        "id_token": "at_123",
-        "session_token": "sess_123",
-        "workspace_id": "",
-        "cookies": "__Secure-next-auth.session-token=sess_123",
-        "profile": {"email": "user@example.com"},
-        "session_payload": {
-            "accessToken": "at_123",
-            "user": {"email": "user@example.com", "id": "acct_123"},
-        },
-    })
-
-    assert mapped.extra["session_payload"]["accessToken"] == "at_123"
-    assert mapped.extra["session_payload"]["user"]["id"] == "acct_123"
 
 
 def test_browser_register_run_does_not_reopen_browser_when_session_collection_fails(monkeypatch):

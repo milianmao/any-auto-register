@@ -27,6 +27,7 @@ const DEFAULT_FORM: Record<string, any> = {
   mail_provider: '',
   sms_provider: '',
   keep_browser_open_on_failure: false,
+  manual_step_mode: false,
 }
 
 function getProviderSetting(settings: ProviderSetting[] = [], providerKey: string) {
@@ -259,6 +260,9 @@ export default function Register() {
     if (form.keep_browser_open_on_failure) {
       extra.keep_browser_open_on_failure = true
     }
+    if (form.manual_step_mode) {
+      extra.manual_step_mode = true
+    }
     allProviderFieldKeys.forEach(fieldKey => {
       if (form[fieldKey] !== undefined) {
         extra[fieldKey] = form[fieldKey]
@@ -442,15 +446,26 @@ export default function Register() {
                 })}
               </div>
               {(form.executor_type === 'headed' || form.executor_type === 'headless') && (
-                <label className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/45 px-3 py-2 text-sm text-[var(--text-secondary)]">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.keep_browser_open_on_failure)}
-                    onChange={e => set('keep_browser_open_on_failure', e.target.checked)}
-                    className="checkbox-accent rounded-[3px] border-[var(--border)] focus:ring-[var(--text-primary)] focus:ring-offset-0 bg-transparent text-[var(--text-primary)]"
-                  />
-                  <span>注册失败时保留浏览器窗口</span>
-                </label>
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/45 px-3 py-2 text-sm text-[var(--text-secondary)]">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(form.keep_browser_open_on_failure)}
+                      onChange={e => set('keep_browser_open_on_failure', e.target.checked)}
+                      className="checkbox-accent rounded-[3px] border-[var(--border)] focus:ring-[var(--text-primary)] focus:ring-offset-0 bg-transparent text-[var(--text-primary)]"
+                    />
+                    <span>注册失败时保留浏览器窗口</span>
+                  </label>
+                  <label className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/45 px-3 py-2 text-sm text-[var(--text-secondary)]">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(form.manual_step_mode)}
+                      onChange={e => set('manual_step_mode', e.target.checked)}
+                      className="checkbox-accent rounded-[3px] border-[var(--border)] focus:ring-[var(--text-primary)] focus:ring-offset-0 bg-transparent text-[var(--text-primary)]"
+                    />
+                    <span>手动点击下一步后再继续流程</span>
+                  </label>
+                </div>
               )}
               {form.identity_provider === 'oauth_browser' && (
                 <>

@@ -51,9 +51,9 @@ APP_DESCRIPTION = "自动注册 OpenAI/Codex CLI 账号的系统"
 # ============================================================================
 
 # OpenAI 基础 URL（支持通过环境变量覆盖）
-OPENAI_AUTH = os.environ.get("OPENAI_AUTH_BASE_URL", "https://auth.openai.com")
+OPENAI_AUTH = os.environ.get("OPENAI_AUTH_BASE_URL", "https://chatgpt.com")
 CHATGPT_APP = os.environ.get("CHATGPT_APP_URL", "https://chatgpt.com")
-PLATFORM_LOGIN_ENTRY = os.environ.get("PLATFORM_LOGIN_ENTRY", "https://platform.openai.com/login")
+PLATFORM_LOGIN_ENTRY = os.environ.get("PLATFORM_LOGIN_ENTRY", "https://chatgpt.com")
 
 # OAuth 参数（支持通过环境变量覆盖）
 # 注册阶段使用 ChatGPT Web client（无 add_phone 要求）

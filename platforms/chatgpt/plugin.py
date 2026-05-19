@@ -170,6 +170,7 @@ class ChatGPTPlatform(BasePlatform):
                 phone_callback=artifacts.phone_callback,
                 log_fn=ctx.log,
                 keep_browser_open_on_failure=bool(ctx.extra.get("keep_browser_open_on_failure")),
+                manual_step_mode=bool(ctx.extra.get("manual_step_mode")),
             ),
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(
                 email=ctx.identity.email or "",
