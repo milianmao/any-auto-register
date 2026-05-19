@@ -265,6 +265,8 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "sms_api_key", "label": "接码 API Key", "type": "text"},
                  {"key": "sms_country", "label": "接码国家", "type": "text"},
                  {"key": "uukg_codes", "label": "UUKG 卡密(一行一个)", "type": "textarea"},
+                 {"key": "headless", "label": "无头模式(PayPal)", "type": "select",
+                  "options": ["true", "false"]},
              ]},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
@@ -395,6 +397,7 @@ class ChatGPTPlatform(BasePlatform):
             pay_config = ProtocolPaymentConfig(
                 country=params.get("country", "US"),
                 proxy=proxy,
+                headless=params.get("headless", "true").lower() != "false",
                 phone=params.get("phone", ""),
                 card_number=params.get("card_number", ""),
                 card_expiry=params.get("card_expiry", ""),

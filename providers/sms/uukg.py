@@ -152,7 +152,16 @@ class UukgSmsProvider(BaseSmsProvider):
             return {"http": self.proxy, "https": self.proxy}
         return None
 
+    # open_* 接口需要 API key，customer_* 接口不需要（网页前端用的）
+    _ACTION_MAP_CUSTOMER = {
+        "open_get_phone": "customer_phone",
+        "open_get_sms": "customer_sms",
+        "open_change_phone": "customer_change_phone",
+    }
+
     def _post(self, action: str, payload: dict, timeout: int = 20) -> dict:
+        if not self.api_key:
+            action = self._ACTION_MAP_CUSTOMER.get(action, action)
         url = f"{self.BASE_URL}/api.php?action={action}"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -173,61 +182,100 @@ class UukgSmsProvider(BaseSmsProvider):
         return data
 
     def get_number(self, *, service: str, country: str = "") -> SmsActivation:
-        code = self._code_pool.take()
-        try:
-            data = self._post("open_get_phone", {"code": code})
-        except Exception as exc:
-            self._code_pool.mark_failed(code, f"get_phone请求失败: {exc}")
-            raise RuntimeError(f"sms.uu.kg 获取手机号失败: {exc}") from exc
-
-        if not data.get("ok"):
-            error_msg = data.get("msg") or data.get("message") or str(data)
-            if "occupied" in error_msg.lower() or "已被使用" in error_msg or "已占用" in error_msg:
-                self._code_pool.mark_failed(code, f"手机号被占用: {error_msg}")
-                raise RuntimeError(f"卡密 {code[:8]}... 对应手机号已被占用: {error_msg}")
-            self._code_pool.mark_failed(code, error_msg)
-            raise RuntimeError(f"sms.uu.kg 获取手机号失败: {error_msg}")
-
-        phone = data.get("phone", "")
-        if not phone:
-            self._code_pool.mark_failed(code, "API未返回手机号")
-            raise RuntimeError("sms.uu.kg 获取手机号成功但未返回号码")
-
-        self._phone_map[code] = phone
-        logger.info("sms.uu.kg 获取手机号成功: %s (卡密: %s...)", phone, code[:8])
-        return SmsActivation(activation_id=code, phone_number=phone)
-
-    def get_code(self, activation_id: str, *, timeout: int = 120) -> str:
-        code_key = activation_id
-        phone = self._phone_map.get(code_key, "")
-        deadline = time.time() + timeout
-        last_data = {}
-
-        while time.time() < deadline:
+        last_exc = None
+        while self._code_pool.available_count > 0:
+            code = self._code_pool.take()
             try:
-                data = self._post("open_get_sms", {"code": code_key})
-                last_data = data
+                data = self._post("open_get_phone", {"code": code})
             except Exception as exc:
-                logger.debug("sms.uu.kg 轮询验证码异常: %s", exc)
-                time.sleep(3)
+                self._code_pool.mark_failed(code, f"get_phone请求失败: {exc}")
+                last_exc = exc
+                logger.warning("卡密 %s... 请求失败: %s，尝试下一个", code[:8], exc)
                 continue
 
-            if data.get("ok") and data.get("code"):
-                sms_code = str(data["code"])
-                logger.info("sms.uu.kg 收到验证码: %s (卡密: %s...)", sms_code, code_key[:8])
-                self._code_pool.mark_used(code_key, phone, sms_code)
-                return sms_code
+            if not data.get("ok"):
+                error_msg = data.get("msg") or data.get("message") or str(data)
+                self._code_pool.mark_failed(code, error_msg)
+                last_exc = RuntimeError(f"sms.uu.kg 获取手机号失败: {error_msg}")
+                logger.warning("卡密 %s... 失败: %s，尝试下一个", code[:8], error_msg)
+                continue
 
-            if data.get("ok") is False:
-                error_msg = data.get("msg") or data.get("message") or ""
-                if "expired" in error_msg.lower() or "过期" in error_msg:
-                    self._code_pool.mark_failed(code_key, f"卡密过期: {error_msg}", phone=phone)
-                    return ""
+            phone = data.get("phone", "")
+            if not phone:
+                self._code_pool.mark_failed(code, "API未返回手机号")
+                last_exc = RuntimeError("sms.uu.kg 获取手机号成功但未返回号码")
+                logger.warning("卡密 %s... 未返回号码，尝试下一个", code[:8])
+                continue
 
-            time.sleep(2)
+            self._phone_map[code] = phone
+            logger.info("sms.uu.kg 获取手机号成功: %s (卡密: %s...)", phone, code[:8])
+            return SmsActivation(activation_id=code, phone_number=phone)
 
-        logger.warning("sms.uu.kg 等待验证码超时 (%ds), 卡密: %s...", timeout, code_key[:8])
-        self._code_pool.mark_failed(code_key, f"等待验证码超时({timeout}s)", phone=phone)
+        if last_exc:
+            raise RuntimeError(f"所有卡密均已尝试失败: {last_exc}") from last_exc
+        raise RuntimeError("卡密池已空，没有可用卡密")
+
+    def get_code(self, activation_id: str, *, timeout: int = 120, max_change: int = 5) -> str:
+        code_key = activation_id
+        phone = self._phone_map.get(code_key, "")
+
+        for attempt in range(1 + max_change):
+            deadline = time.time() + timeout
+
+            while time.time() < deadline:
+                try:
+                    data = self._post("open_get_sms", {"code": code_key})
+                except Exception as exc:
+                    logger.debug("sms.uu.kg 轮询验证码异常: %s", exc)
+                    time.sleep(3)
+                    continue
+
+                if data.get("ok") and data.get("code"):
+                    sms_code = str(data["code"])
+                    logger.info("sms.uu.kg 收到验证码: %s (卡密: %s...)", sms_code, code_key[:8])
+                    self._code_pool.mark_used(code_key, phone, sms_code)
+                    return sms_code
+
+                if data.get("ok") is False:
+                    error_msg = data.get("msg") or data.get("message") or ""
+                    if "expired" in error_msg.lower() or "过期" in error_msg:
+                        self._code_pool.mark_failed(code_key, f"卡密过期: {error_msg}", phone=phone)
+                        return ""
+
+                time.sleep(5)
+
+            # 超时，尝试用同一卡密换号
+            if attempt >= max_change:
+                break
+
+            logger.warning("sms.uu.kg 验证码超时 (第%d次), 卡密 %s... 换号重试", attempt + 1, code_key[:8])
+            try:
+                change_data = self._post("open_change_phone", {"code": code_key})
+                if not change_data.get("ok"):
+                    err = change_data.get("msg") or change_data.get("message") or str(change_data)
+                    logger.warning("sms.uu.kg 换号失败: %s", err)
+                    break
+            except Exception as exc:
+                logger.warning("sms.uu.kg 换号请求异常: %s", exc)
+                break
+
+            # 换号后重新获取新手机号
+            try:
+                phone_data = self._post("open_get_phone", {"code": code_key})
+                if phone_data.get("ok") and phone_data.get("phone"):
+                    phone = phone_data["phone"]
+                    self._phone_map[code_key] = phone
+                    logger.info("sms.uu.kg 换号成功: %s (卡密: %s...)", phone, code_key[:8])
+                else:
+                    err = phone_data.get("msg") or phone_data.get("message") or str(phone_data)
+                    logger.warning("sms.uu.kg 换号后获取号码失败: %s", err)
+                    break
+            except Exception as exc:
+                logger.warning("sms.uu.kg 换号后获取号码异常: %s", exc)
+                break
+
+        logger.warning("sms.uu.kg 验证码最终失败, 卡密: %s...", code_key[:8])
+        self._code_pool.mark_failed(code_key, f"验证码超时(换号{max_change}次)", phone=phone)
         return ""
 
     def cancel(self, activation_id: str) -> bool:

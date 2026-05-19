@@ -5,12 +5,14 @@ ChatGPT Plus 自动支付 — 协议模式（纯 HTTP，完全模拟浏览器）
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 import secrets
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -25,6 +27,7 @@ class ProtocolPaymentConfig:
     """协议模式支付配置"""
     country: str = "US"
     proxy: Optional[str] = None
+    headless: bool = True
     payment_timeout: int = 300
     phone: str = ""
     card_number: str = ""
@@ -166,13 +169,35 @@ def _create_browser_session(proxy: Optional[str] = None) -> Session:
     return session
 
 
-def _navigate_headers(referer: str = "") -> dict:
-    """模拟浏览器导航请求头"""
+def _human_delay(lo: float = 0.5, hi: float = 2.0):
+    """模拟人类操作间隔，避免机器行为特征"""
+    import random
+    time.sleep(random.uniform(lo, hi))
+
+
+def _navigate_headers(referer: str = "", target_url: str = "") -> dict:
+    """模拟浏览器导航请求头，根据 referer 和 target 自动判断 Sec-Fetch-Site"""
+    if not referer:
+        site = "none"
+    elif referer and target_url:
+        ref_host = urllib.parse.urlparse(referer).netloc
+        tgt_host = urllib.parse.urlparse(target_url).netloc
+        if ref_host == tgt_host:
+            site = "same-origin"
+        elif ref_host.split(".")[-2:] == tgt_host.split(".")[-2:]:
+            site = "same-site"
+        else:
+            site = "cross-site"
+    else:
+        site = "cross-site"
     h = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "cross-site" if referer else "none",
+        "Sec-Fetch-Site": site,
         "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
     if referer:
         h["Referer"] = referer
@@ -193,56 +218,10 @@ def _xhr_headers(origin: str, referer: str) -> dict:
     }
 
 
+
 # ============================================================
-# HTML 解析辅助（避免引入 BeautifulSoup 依赖）
+# Stripe 辅助
 # ============================================================
-
-def _extract_hidden_inputs(html: str) -> Dict[str, str]:
-    """从 HTML 中提取所有 hidden input 的 name/value"""
-    inputs = {}
-    pattern = r'<input[^>]*type=["\']hidden["\'][^>]*>'
-    for match in re.finditer(pattern, html, re.IGNORECASE):
-        tag = match.group(0)
-        name_m = re.search(r'name=["\']([^"\']*)["\']', tag)
-        value_m = re.search(r'value=["\']([^"\']*)["\']', tag)
-        if name_m:
-            inputs[name_m.group(1)] = value_m.group(1) if value_m else ""
-    return inputs
-
-
-def _extract_form_action(html: str, form_id: str = "") -> str:
-    """提取表单的 action URL"""
-    if form_id:
-        pattern = rf'<form[^>]*id=["\']{ re.escape(form_id) }["\'][^>]*action=["\']([^"\']*)["\']'
-    else:
-        pattern = r'<form[^>]*action=["\']([^"\']*)["\']'
-    m = re.search(pattern, html, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-def _extract_meta_redirect(html: str) -> str:
-    """提取 meta refresh 重定向 URL"""
-    m = re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'"\s>]+)', html, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r'<meta[^>]*content=["\'][^"\']*url=([^"\'"\s>]+)["\'][^>]*http-equiv=["\']refresh["\']', html, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-def _extract_js_redirect(html: str) -> str:
-    """提取 JS window.location 重定向"""
-    patterns = [
-        r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
-        r'window\.location\.replace\s*\(\s*["\']([^"\']+)["\']',
-        r'window\.location\s*=\s*["\']([^"\']+)["\']',
-        r'location\.href\s*=\s*["\']([^"\']+)["\']',
-    ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return m.group(1)
-    return ""
-
 
 def _extract_stripe_page_id(url: str) -> str:
     """从 Stripe hosted URL 提取 payment page ID (cs_live_xxx)"""
@@ -250,26 +229,18 @@ def _extract_stripe_page_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def _extract_select_options(html: str, select_id: str) -> Dict[str, str]:
-    """提取 select 元素的所有 option (value -> text)"""
-    pattern = rf'<select[^>]*id=["\']{ re.escape(select_id) }["\'][^>]*>(.*?)</select>'
-    m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-    if not m:
+def _decode_stripe_fragment(hosted_url: str) -> dict:
+    """从 Stripe hosted URL 的 fragment 解码配置（XOR 0x05 + base64）"""
+    if "#" not in hosted_url:
         return {}
-    options_html = m.group(1)
-    options = {}
-    for opt in re.finditer(r'<option[^>]*value=["\']([^"\']*)["\'][^>]*>(.*?)</option>', options_html, re.DOTALL):
-        options[opt.group(1)] = opt.group(2).strip()
-    return options
-
-
-def _find_select_value(options: Dict[str, str], text: str) -> str:
-    """根据文本匹配 select option 的 value"""
-    text_lower = text.lower()
-    for val, label in options.items():
-        if text_lower in label.lower() or text_lower in val.lower():
-            return val
-    return ""
+    fragment = urllib.parse.unquote(hosted_url.split("#", 1)[1])
+    try:
+        padded = fragment + "=" * (4 - len(fragment) % 4)
+        raw = base64.urlsafe_b64decode(padded)
+        decoded = bytes(b ^ 0x05 for b in raw).decode("ascii", errors="replace")
+        return json.loads(decoded)
+    except Exception:
+        return {}
 
 
 # ============================================================
@@ -292,58 +263,49 @@ def _stripe_load_checkout(session: Session, hosted_url: str, log_fn) -> Tuple[st
     return resp.text, str(resp.url)
 
 
-def _stripe_extract_session_data(html: str) -> dict:
-    """
-    从 Stripe checkout 页面的内联 JS 中提取会话数据
-    Stripe 在页面中嵌入了 JSON 配置，包含 payment_page_id、session_id 等
-    """
-    patterns = [
-        r'window\.__STRIPE_CHECKOUT_SESSION__\s*=\s*({.*?});',
-        r'"paymentPageId"\s*:\s*"([^"]+)"',
-        r'"sessionId"\s*:\s*"([^"]+)"',
-        r'"publishableKey"\s*:\s*"(pk_(?:live|test)_[^"]+)"',
-        r'data-session-id="([^"]+)"',
-        r'data-publishable-key="([^"]+)"',
-    ]
-    data = {}
-
-    # 尝试提取完整的 JSON 配置
-    json_pattern = r'<script[^>]*>\s*window\.__(?:STRIPE_CHECKOUT|NEXT_DATA)__\s*=\s*({.*?})\s*;?\s*</script>'
-    m = re.search(json_pattern, html, re.DOTALL)
-    if m:
-        try:
-            data["__config__"] = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # 提取各个关键字段
-    for key, pattern in [
-        ("payment_page_id", r'"paymentPageId"\s*:\s*"([^"]+)"'),
-        ("session_id", r'"sessionId"\s*:\s*"([^"]+)"'),
-        ("publishable_key", r'"publishableKey"\s*:\s*"(pk_[^"]+)"'),
-        ("api_key", r'"apiKey"\s*:\s*"(pk_[^"]+)"'),
-        ("merchant_id", r'"merchantId"\s*:\s*"(acct_[^"]+)"'),
-        ("payment_intent", r'"paymentIntent"\s*:\s*"(pi_[^"]+)"'),
-        ("stripe_js_id", r'"stripeJsId"\s*:\s*"([^"]+)"'),
-        ("auth_token", r'"authenticity_token"\s*:\s*"([^"]+)"'),
-        ("csrf_token", r'name="csrf-token"\s+content="([^"]+)"'),
-    ]:
-        m = re.search(pattern, html)
-        if m:
-            data[key] = m.group(1)
-
-    # 从 data attributes 提取
-    for attr_key, attr_name in [
-        ("session_id", "data-session-id"),
-        ("publishable_key", "data-publishable-key"),
-        ("stripe_account", "data-stripe-account"),
-    ]:
-        if attr_key not in data:
-            m = re.search(rf'{attr_name}="([^"]+)"', html)
-            if m:
-                data[attr_key] = m.group(1)
-
+def _stripe_init_session(session: Session, hosted_url: str, page_id: str, pk: str, log_fn) -> dict:
+    """调用 Stripe init API 获取 checkout session 数据"""
+    eid = str(uuid.uuid4())
+    resp = session.post(
+        f"https://api.stripe.com/v1/payment_pages/{page_id}/init",
+        data={"key": pk, "eid": eid, "browser_locale": "en-US"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://pay.openai.com",
+            "Referer": hosted_url,
+        },
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"Stripe init 失败: {resp.status_code} {resp.text[:300]}")
+    data = resp.json()
+    data["_eid"] = eid
     return data
+
+
+def _stripe_create_paypal_pm(session: Session, pk: str, identity, config, hosted_url: str) -> str:
+    """创建 PayPal 类型的 PaymentMethod，返回 pm_xxx ID"""
+    state = getattr(identity, "state_abbr", "") or getattr(identity, "state", "")
+    resp = session.post(
+        "https://api.stripe.com/v1/payment_methods",
+        data={
+            "type": "paypal",
+            "key": pk,
+            "billing_details[address][country]": config.country or "US",
+            "billing_details[address][line1]": identity.street or "100 Main St",
+            "billing_details[address][city]": identity.city or "Portland",
+            "billing_details[address][state]": state or "OR",
+            "billing_details[address][postal_code]": identity.zipcode or "97204",
+            "billing_details[name]": identity.full_name or "John Smith",
+        },
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://pay.openai.com",
+            "Referer": hosted_url,
+        },
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"创建 PaymentMethod 失败: {resp.status_code} {resp.text[:300]}")
+    return resp.json()["id"]
 
 
 def _stripe_confirm_paypal(
@@ -353,57 +315,71 @@ def _stripe_confirm_paypal(
     identity,
     config: ProtocolPaymentConfig,
     log_fn,
-) -> str:
+) -> tuple[str, str]:
     """
-    在 Stripe checkout 页面选择 PayPal 并提交，返回 PayPal redirect URL
-    模拟浏览器提交表单 → Stripe confirm API → 跟踪重定向到 PayPal
+    Stripe checkout: 解码 fragment 获取 pk → init → 创建 PM → confirm → 提取 PayPal redirect
+    返回 (pm_redirect_url, paypal_url)
     """
-    stripe_data = _stripe_extract_session_data(page_html)
     page_id = _extract_stripe_page_id(hosted_url)
+    if not page_id:
+        raise ValueError("无法从 URL 提取 Stripe session ID")
 
-    log_fn(f"[协议] Stripe session 数据: page_id={page_id}, keys={list(stripe_data.keys())}")
+    # 从 fragment XOR 解码获取 publishable key
+    frag_data = _decode_stripe_fragment(hosted_url)
+    pk = frag_data.get("apiKey", "")
+    if not pk:
+        log_fn("[协议] fragment 解码未找到 apiKey，尝试从 HTML 提取...")
+        m = re.search(r'pk_live_[A-Za-z0-9]+', page_html)
+        pk = m.group(0) if m else ""
+    if not pk:
+        raise ValueError("无法获取 Stripe publishable key")
+    log_fn(f"[协议] Stripe PK: {pk[:30]}...")
 
-    state_full = _resolve_state(identity.state, getattr(identity, 'state_abbr', ''))
+    # Init session
+    log_fn("[协议] 调用 Stripe init...")
+    init_data = _stripe_init_session(session, hosted_url, page_id, pk, log_fn)
+    init_checksum = init_data.get("init_checksum", "")
+    eid = init_data["_eid"]
 
-    # 查找 state 对应的 Stripe select value
-    state_options = _extract_select_options(page_html, "billingAdministrativeArea")
-    state_value = _find_select_value(state_options, state_full) if state_options else state_full
+    invoice = init_data.get("invoice") or {}
+    amount_due = invoice.get("amount_due", 2000)
+    bca = invoice.get("billing_cycle_anchor")
+    log_fn(f"[协议] init 成功: amount={amount_due}, checksum={init_checksum[:16]}...")
 
-    pk = stripe_data.get("publishable_key") or stripe_data.get("api_key", "")
-    merchant_id = stripe_data.get("merchant_id", "")
+    # 创建 PayPal PaymentMethod
+    _human_delay(1.0, 2.0)
+    log_fn("[协议] 创建 PayPal PaymentMethod...")
+    pm_id = _stripe_create_paypal_pm(session, pk, identity, config, hosted_url)
+    log_fn(f"[协议] PM: {pm_id}")
 
-    confirm_url = f"https://api.stripe.com/v1/payment_pages/{page_id}/confirm"
+    # Confirm
+    _human_delay(1.0, 2.5)
+    if bca:
+        expected_amount = 0
+        extra = {"expected_amount_on_bca": str(amount_due)}
+    else:
+        expected_amount = amount_due
+        extra = {}
 
-    # 构建完全模拟浏览器的 confirm 请求
-    form_data = {
-        "eid": f"NA-{secrets.token_hex(16)}",
-        "payment_method": "paypal",
-        "billing_address[country]": config.country or "US",
-        "billing_address[line1]": identity.street,
-        "billing_address[line2]": "",
-        "billing_address[city]": identity.city,
-        "billing_address[state]": state_value or state_full,
-        "billing_address[postal_code]": identity.zipcode,
-        "terms_of_service_consent[accepted]": "true",
+    confirm_data = {
+        "eid": eid,
+        "payment_method": pm_id,
+        "expected_amount": str(expected_amount),
+        "consent[terms_of_service]": "accepted",
         "key": pk,
+        "init_checksum": init_checksum,
     }
+    confirm_data.update(extra)
 
-    if merchant_id:
-        form_data["stripe_account"] = merchant_id
-
-    log_fn("[协议] 提交 Stripe confirm (选择 PayPal)...")
-
-    stripe_origin = "https://pay.openai.com"
-    stripe_referer = hosted_url
-
+    log_fn(f"[协议] 提交 Stripe confirm (PayPal, expected_amount={expected_amount})...")
     resp = session.post(
-        confirm_url,
-        data=form_data,
+        f"https://api.stripe.com/v1/payment_pages/{page_id}/confirm",
+        data=confirm_data,
         headers={
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": stripe_origin,
-            "Referer": stripe_referer,
+            "Origin": "https://pay.openai.com",
+            "Referer": hosted_url,
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "cross-site",
@@ -416,523 +392,71 @@ def _stripe_confirm_paypal(
     if resp.status_code in (200, 201):
         try:
             data = resp.json()
-            redirect_url = (
-                data.get("redirect_url")
-                or data.get("next_action", {}).get("redirect_to_url", {}).get("url", "")
-                or data.get("url", "")
-            )
-            if redirect_url:
-                log_fn(f"[协议] 获取到重定向 URL: {redirect_url[:80]}...")
-                return _follow_stripe_redirect(session, redirect_url, stripe_referer, log_fn)
-            log_fn(f"[协议] confirm 响应内容: {json.dumps(data, ensure_ascii=False)[:500]}")
         except Exception as e:
-            log_fn(f"[协议] 解析 confirm 响应失败: {e}")
+            raise ValueError(f"解析 Stripe confirm JSON 失败: {e}")
+
+        text = json.dumps(data)
+        pm_redirects = re.findall(r'https?://pm-redirects\.stripe\.com/[^"\\]+', text)
+        if pm_redirects:
+            redirect_url = pm_redirects[0]
+            log_fn(f"[协议] 获取到 PM redirect: {redirect_url[:80]}...")
+            # 不用 HTTP 消费 redirect，直接返回给浏览器使用
+            return redirect_url, ""
+
+        redirect_url = (
+            data.get("redirect_url")
+            or data.get("next_action", {}).get("redirect_to_url", {}).get("url", "")
+        )
+        if redirect_url:
+            log_fn(f"[协议] 获取到重定向 URL: {redirect_url[:80]}...")
+            paypal_url = _follow_stripe_redirect(session, redirect_url, hosted_url, log_fn)
+            return redirect_url, paypal_url
+
+        log_fn(f"[协议] confirm 响应无重定向 URL, status={data.get('status')}")
 
     elif resp.status_code in (302, 303, 307):
         redirect_url = resp.headers.get("Location", "")
         if redirect_url:
             log_fn(f"[协议] 302 重定向到: {redirect_url[:80]}...")
-            return _follow_stripe_redirect(session, redirect_url, stripe_referer, log_fn)
+            paypal_url = _follow_stripe_redirect(session, redirect_url, hosted_url, log_fn)
+            return redirect_url, paypal_url
 
     raise ValueError(f"Stripe confirm 未返回 PayPal 重定向 (status={resp.status_code})")
 
 
 def _follow_stripe_redirect(session: Session, url: str, referer: str, log_fn) -> str:
     """
-    跟踪 Stripe → PayPal 的重定向链
-    pm-redirects.stripe.com → paypal.com/agreements/approve?ba_token=xxx
+    跟踪 pm-redirects.stripe.com 的 302 重定向，提取 PayPal URL。
+    不加载 PayPal 页面（DataDome 会拦截），只返回 URL 给浏览器使用。
     """
-    current_url = url
-    max_redirects = 10
-
-    for i in range(max_redirects):
-        log_fn(f"[协议] 跟踪重定向 [{i+1}]: {current_url[:80]}...")
-
-        resp = session.get(
-            current_url,
-            headers=_navigate_headers(referer),
-            allow_redirects=False,
-        )
-
-        if resp.status_code in (301, 302, 303, 307, 308):
-            next_url = resp.headers.get("Location", "")
-            if not next_url:
-                break
-            if not next_url.startswith("http"):
-                parsed = urllib.parse.urlparse(current_url)
-                next_url = f"{parsed.scheme}://{parsed.netloc}{next_url}"
-            referer = current_url
-            current_url = next_url
-
-            if "paypal.com" in current_url:
-                log_fn(f"[协议] 到达 PayPal: {current_url[:100]}...")
-                return current_url
-            continue
-
-        if resp.status_code == 200:
-            html = resp.text
-            # 检查 meta refresh 或 JS 重定向
-            meta_url = _extract_meta_redirect(html)
-            if meta_url:
-                referer = current_url
-                current_url = meta_url
-                if "paypal.com" in current_url:
-                    return current_url
-                continue
-
-            js_url = _extract_js_redirect(html)
-            if js_url:
-                referer = current_url
-                current_url = js_url
-                if "paypal.com" in current_url:
-                    return current_url
-                continue
-
-            if "paypal.com" in current_url:
-                return current_url
-
-        break
-
-    raise ValueError(f"重定向链未到达 PayPal (最终: {current_url[:100]})")
-
-
-# ============================================================
-# PayPal 协议流程
-# ============================================================
-
-def _paypal_load_page(session: Session, paypal_url: str, referer: str, log_fn) -> Tuple[str, str]:
-    """
-    加载 PayPal 页面，完全模拟浏览器导航
-    返回 (html, final_url)
-    """
-    log_fn(f"[协议] 加载 PayPal 页面: {paypal_url[:80]}...")
+    log_fn(f"[协议] 跟踪重定向: {url[:80]}...")
+    _human_delay(0.5, 1.5)
 
     resp = session.get(
-        paypal_url,
-        headers=_navigate_headers(referer),
-        allow_redirects=True,
+        url,
+        headers=_navigate_headers(referer, url),
+        allow_redirects=False,
+        timeout=30,
     )
 
-    log_fn(f"[协议] PayPal 页面状态: {resp.status_code}, URL: {str(resp.url)[:80]}...")
+    if resp.status_code in (301, 302, 303, 307, 308):
+        location = resp.headers.get("Location", "")
+        if location:
+            log_fn(f"[协议] 302 重定向到: {location[:100]}")
+            return location
 
-    if resp.status_code == 403:
-        log_fn("[协议] PayPal 返回 403，可能触发了 DataDome 检测")
-        raise ValueError("PayPal 403 Forbidden - DataDome 反爬检测")
-
-    resp.raise_for_status()
-    return resp.text, str(resp.url)
-
-
-def _paypal_extract_csrf(html: str) -> str:
-    """提取 PayPal 页面中的 CSRF token"""
-    patterns = [
-        r'"_csrf"\s*:\s*"([^"]+)"',
-        r'name="_csrf"\s+(?:value|content)="([^"]+)"',
-        r'"token"\s*:\s*"([^"]+)"',
-        r'name="token"\s+value="([^"]+)"',
-        r'"xsrfTokenValue"\s*:\s*"([^"]+)"',
-    ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return m.group(1)
-    return ""
-
-
-def _paypal_extract_flow_id(html: str) -> str:
-    """提取 PayPal flow ID"""
-    patterns = [
-        r'"flowId"\s*:\s*"([^"]+)"',
-        r'name="flowId"\s+value="([^"]+)"',
-        r'"flow_id"\s*:\s*"([^"]+)"',
-    ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return m.group(1)
-    return ""
-
-
-def _paypal_extract_session_token(html: str) -> str:
-    """提取 PayPal session token"""
-    patterns = [
-        r'"sessionToken"\s*:\s*"([^"]+)"',
-        r'"sessionID"\s*:\s*"([^"]+)"',
-        r'"session_id"\s*:\s*"([^"]+)"',
-    ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return m.group(1)
-    return ""
-
-
-def _paypal_handle_agreements_page(
-    session: Session,
-    page_html: str,
-    page_url: str,
-    log_fn,
-) -> Tuple[str, str]:
-    """
-    处理 PayPal /agreements/approve 页面
-    这个页面通常会重定向到 /pay 或 /checkoutweb
-    返回 (next_page_html, next_page_url)
-    """
-    log_fn("[协议] 处理 PayPal agreements 页面...")
-
-    # 检查页面是否直接包含重定向
-    meta_url = _extract_meta_redirect(page_html)
-    if meta_url:
-        log_fn(f"[协议] agreements meta 重定向到: {meta_url[:80]}...")
-        return _paypal_load_page(session, meta_url, page_url, log_fn)
-
-    js_url = _extract_js_redirect(page_html)
-    if js_url:
-        if not js_url.startswith("http"):
-            parsed = urllib.parse.urlparse(page_url)
-            js_url = f"{parsed.scheme}://{parsed.netloc}{js_url}"
-        log_fn(f"[协议] agreements JS 重定向到: {js_url[:80]}...")
-        return _paypal_load_page(session, js_url, page_url, log_fn)
-
-    # 检查表单提交
-    form_action = _extract_form_action(page_html)
-    if form_action:
-        hidden_inputs = _extract_hidden_inputs(page_html)
-        if not form_action.startswith("http"):
-            parsed = urllib.parse.urlparse(page_url)
-            form_action = f"{parsed.scheme}://{parsed.netloc}{form_action}"
-        log_fn(f"[协议] agreements 表单提交到: {form_action[:80]}...")
-        resp = session.post(
-            form_action,
-            data=hidden_inputs,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": f"https://{urllib.parse.urlparse(page_url).netloc}",
-                "Referer": page_url,
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-User": "?1",
-            },
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-        return resp.text, str(resp.url)
-
-    return page_html, page_url
-
-
-def _paypal_submit_email(
-    session: Session,
-    page_html: str,
-    page_url: str,
-    email: str,
-    log_fn,
-) -> Tuple[str, str]:
-    """
-    PayPal /pay 页面 — 提交邮箱
-    完全模拟浏览器表单提交
-    """
-    log_fn(f"[协议] PayPal /pay 页面，提交邮箱: {email}")
-
-    csrf = _paypal_extract_csrf(page_html)
-    flow_id = _paypal_extract_flow_id(page_html)
-    hidden_inputs = _extract_hidden_inputs(page_html)
-    form_action = _extract_form_action(page_html)
-
-    if not form_action:
-        # PayPal /pay 页面通常用 AJAX 提交
-        # 尝试找到 API endpoint
-        api_patterns = [
-            r'"submitUrl"\s*:\s*"([^"]+)"',
-            r'"actionUrl"\s*:\s*"([^"]+)"',
-        ]
-        for p in api_patterns:
-            m = re.search(p, page_html)
-            if m:
-                form_action = m.group(1)
-                break
-
-    paypal_origin = f"https://{urllib.parse.urlparse(page_url).netloc}"
-
-    if not form_action:
-        form_action = page_url
-
-    if not form_action.startswith("http"):
-        form_action = paypal_origin + form_action
-
-    post_data = {**hidden_inputs}
-    post_data["email"] = email
-    if csrf:
-        post_data["_csrf"] = csrf
-    if flow_id:
-        post_data["flowId"] = flow_id
-
-    log_fn(f"[协议] 提交邮箱到: {form_action[:80]}...")
-
-    resp = session.post(
-        form_action,
-        data=post_data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": paypal_origin,
-            "Referer": page_url,
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
-        },
+    log_fn(f"[协议] pm-redirects 未返回 302 (status={resp.status_code})，尝试 allow_redirects...")
+    resp = session.get(
+        url,
+        headers=_navigate_headers(referer, url),
         allow_redirects=True,
+        timeout=30,
     )
-
-    log_fn(f"[协议] 邮箱提交响应: {resp.status_code}, URL: {str(resp.url)[:80]}...")
-    resp.raise_for_status()
-    return resp.text, str(resp.url)
-
-
-def _paypal_submit_checkout(
-    session: Session,
-    page_html: str,
-    page_url: str,
-    identity,
-    config: ProtocolPaymentConfig,
-    email: str,
-    password: str,
-    log_fn,
-    sms_controller=None,
-) -> Tuple[str, str]:
-    """
-    PayPal /checkoutweb 页面 — 提交完整表单（注册+支付）
-    完全模拟浏览器表单提交
-    """
-    log_fn("[协议] PayPal checkout 页面，构建完整表单...")
-
-    csrf = _paypal_extract_csrf(page_html)
-    flow_id = _paypal_extract_flow_id(page_html)
-    session_token = _paypal_extract_session_token(page_html)
-    hidden_inputs = _extract_hidden_inputs(page_html)
-    form_action = _extract_form_action(page_html)
-
-    paypal_origin = f"https://{urllib.parse.urlparse(page_url).netloc}"
-
-    if not form_action:
-        api_patterns = [
-            r'"submitUrl"\s*:\s*"([^"]+)"',
-            r'"createAccountUrl"\s*:\s*"([^"]+)"',
-            r'"actionUrl"\s*:\s*"([^"]+)"',
-        ]
-        for p in api_patterns:
-            m = re.search(p, page_html)
-            if m:
-                form_action = m.group(1)
-                break
-
-    if not form_action:
-        form_action = page_url
-
-    if not form_action.startswith("http"):
-        form_action = paypal_origin + form_action
-
-    state_full = _resolve_state(identity.state, getattr(identity, 'state_abbr', ''))
-
-    # 尝试匹配 state select value
-    state_options = _extract_select_options(page_html, "billingState")
-    state_value = _find_select_value(state_options, state_full) if state_options else state_full
-
-    # 手机号：优先使用接码平台
-    if sms_controller:
-        log_fn("[协议] 使用接码平台获取手机号...")
-        try:
-            sms_phone = str(sms_controller() or "").strip()
-            if sms_phone:
-                log_fn(f"[协议] 接码平台手机号: {sms_phone}")
-                phone = sms_phone
-            else:
-                log_fn("[协议] 接码平台未返回手机号，使用备用号码")
-                phone = config.phone or getattr(identity, 'phone', '') or ""
-        except Exception as e:
-            log_fn(f"[协议] 接码获取手机号失败: {e}，使用备用号码")
-            phone = config.phone or getattr(identity, 'phone', '') or ""
-    else:
-        phone = config.phone or getattr(identity, 'phone', '') or ""
-
-    card_number = config.card_number or getattr(identity, 'card_number', '') or ""
-    card_expiry = config.card_expiry or getattr(identity, 'card_expiry', '') or ""
-    card_cvv = config.card_cvv or getattr(identity, 'card_cvv', '') or ""
-
-    post_data = {**hidden_inputs}
-    post_data.update({
-        "email": email,
-        "password": password,
-        "phone": phone,
-        "phoneCode": "US+1",
-        "cardNumber": card_number,
-        "cardExpiry": card_expiry,
-        "cardCvv": card_cvv,
-        "firstName": getattr(identity, 'first_name', '') or "James",
-        "lastName": getattr(identity, 'last_name', '') or "Smith",
-        "billingLine1": identity.street,
-        "billingLine2": "",
-        "billingCity": identity.city,
-        "billingState": state_value or state_full,
-        "billingPostalCode": identity.zipcode,
-        "country": "US",
-    })
-
-    if csrf:
-        post_data["_csrf"] = csrf
-    if flow_id:
-        post_data["flowId"] = flow_id
-    if session_token:
-        post_data["sessionToken"] = session_token
-
-    log_fn(f"[协议] 提交 checkout 表单到: {form_action[:80]}...")
-    log_fn(f"[协议] 表单字段: email={email}, phone={phone}, "
-           f"name={identity.first_name} {identity.last_name}, city={identity.city}")
-
-    resp = session.post(
-        form_action,
-        data=post_data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": paypal_origin,
-            "Referer": page_url,
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
-        },
-        allow_redirects=True,
-    )
-
-    log_fn(f"[协议] checkout 提交响应: {resp.status_code}, URL: {str(resp.url)[:80]}...")
-    resp.raise_for_status()
-
-    result_html = resp.text
-    result_url = str(resp.url)
-
-    # 检测是否需要短信验证
-    if sms_controller:
-        result_html, result_url = _handle_sms_verification_protocol(
-            session, result_html, result_url, sms_controller, log_fn,
-        )
-
-    return result_html, result_url
+    final_url = str(resp.url)
+    log_fn(f"[协议] 最终 URL: {final_url[:100]}")
+    return final_url
 
 
-# ============================================================
-# 短信验证（协议模式）
-# ============================================================
-
-def _detect_otp_form(html: str) -> bool:
-    """检测 HTML 中是否包含验证码输入表单"""
-    patterns = [
-        r'name=["\'](?:code|otp|verify|verification)',
-        r'id=["\'](?:code|otp|verify|verification)',
-        r'autocomplete=["\']one-time-code',
-        r'(?:verification|verify|确认).{0,100}<input',
-        r'<input.{0,100}(?:verification|verify|code|otp)',
-    ]
-    for p in patterns:
-        if re.search(p, html, re.IGNORECASE):
-            return True
-    return False
-
-
-def _submit_otp_form(
-    session: Session,
-    page_html: str,
-    page_url: str,
-    code: str,
-    log_fn,
-) -> Tuple[str, str]:
-    """提交验证码表单"""
-    hidden_inputs = _extract_hidden_inputs(page_html)
-    form_action = _extract_form_action(page_html)
-    csrf = _paypal_extract_csrf(page_html)
-
-    paypal_origin = f"https://{urllib.parse.urlparse(page_url).netloc}"
-
-    if not form_action:
-        form_action = page_url
-    if not form_action.startswith("http"):
-        form_action = paypal_origin + form_action
-
-    post_data = {**hidden_inputs}
-    # 尝试多种验证码字段名
-    for field_name in ("code", "otp", "verificationCode", "smsCode"):
-        post_data[field_name] = code
-    if csrf:
-        post_data["_csrf"] = csrf
-
-    log_fn(f"[协议] 提交验证码到: {form_action[:80]}...")
-
-    resp = session.post(
-        form_action,
-        data=post_data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": paypal_origin,
-            "Referer": page_url,
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
-        },
-        allow_redirects=True,
-    )
-    resp.raise_for_status()
-    return resp.text, str(resp.url)
-
-
-def _handle_sms_verification_protocol(
-    session: Session,
-    page_html: str,
-    page_url: str,
-    sms_controller,
-    log_fn,
-) -> Tuple[str, str]:
-    """检测并处理协议模式下的短信验证"""
-    if not _detect_otp_form(page_html):
-        log_fn("[协议] 未检测到短信验证码表单，跳过")
-        return page_html, page_url
-
-    log_fn("[协议] 检测到短信验证码表单，等待接收验证码...")
-    try:
-        sms_code = str(sms_controller() or "").strip()
-        if not sms_code:
-            log_fn("[协议] 未收到短信验证码")
-            return page_html, page_url
-
-        log_fn(f"[协议] 收到验证码: {sms_code}")
-        result_html, result_url = _submit_otp_form(
-            session, page_html, page_url, sms_code, log_fn,
-        )
-        log_fn(f"[协议] 验证码提交后 URL: {result_url[:80]}...")
-
-        if hasattr(sms_controller, "report_success"):
-            sms_controller.report_success()
-
-        return result_html, result_url
-
-    except Exception as e:
-        log_fn(f"[协议] 短信验证流程异常: {e}")
-        return page_html, page_url
-
-
-# ============================================================
-# 检测支付结果
-# ============================================================
-
-def _check_payment_success(html: str, url: str) -> bool:
-    """检查是否支付成功"""
-    if "chatgpt.com" in url and "success" in url:
-        return True
-    if "chatgpt.com" in url and "checkout" not in url and "pricing" not in url:
-        return True
-    success_texts = ["success", "thank you", "you are now subscribed", "payment confirmed"]
-    body_lower = html.lower()
-    return any(t in body_lower for t in success_texts)
 
 
 # ============================================================
@@ -1008,79 +532,163 @@ def _protocol_flow(
     result: ProtocolPaymentResult,
     sms_controller=None,
 ) -> ProtocolPaymentResult:
-    """协议模式完整支付流程"""
+    """混合模式支付流程：协议模式处理 Stripe，浏览器模式处理 PayPal"""
 
-    # === Step 1: 加载 Stripe checkout 页面 ===
+    # === Step 1: 协议模式 — 加载 Stripe checkout 页面 ===
     stripe_html, stripe_url = _stripe_load_checkout(session, hosted_url, log_fn)
 
-    # === Step 2: 提交 Stripe confirm（选 PayPal + 填地址）→ 获取 PayPal URL ===
-    paypal_url = _stripe_confirm_paypal(
+    # === Step 2: 协议模式 — Stripe confirm → 获取 PayPal URL ===
+    pm_redirect_url, paypal_url = _stripe_confirm_paypal(
         session, hosted_url, stripe_html, identity, config, log_fn,
     )
+    if paypal_url:
+        log_fn(f"[协议] PayPal URL: {paypal_url[:100]}")
+    log_fn(f"[协议] PM redirect URL: {pm_redirect_url[:80]}...")
 
-    # === Step 3: 加载 PayPal 页面 ===
-    paypal_html, paypal_final_url = _paypal_load_page(session, paypal_url, stripe_url, log_fn)
+    # === Step 3: 浏览器模式 — Playwright 处理 PayPal ===
+    log_fn("[协议] 切换到浏览器模式处理 PayPal...")
+    success = _browser_paypal_flow(
+        pm_redirect_url, paypal_url, identity, config,
+        paypal_email, paypal_password, log_fn,
+        sms_controller=sms_controller,
+    )
 
-    # === Step 4: 根据 PayPal 页面路径分发处理 ===
-    if "/agreements/approve" in paypal_final_url:
-        log_fn("[协议] 处理 agreements/approve 页面...")
-        paypal_html, paypal_final_url = _paypal_handle_agreements_page(
-            session, paypal_html, paypal_final_url, log_fn,
-        )
-
-    if "/pay" in paypal_final_url and "/checkoutweb" not in paypal_final_url:
-        log_fn("[协议] 进入 PayPal /pay 邮箱页面...")
-        paypal_html, paypal_final_url = _paypal_submit_email(
-            session, paypal_html, paypal_final_url, paypal_email, log_fn,
-        )
-
-    if "/checkoutweb" in paypal_final_url:
-        log_fn("[协议] 进入 PayPal /checkoutweb 注册+支付页面...")
-        final_html, final_url = _paypal_submit_checkout(
-            session, paypal_html, paypal_final_url,
-            identity, config, paypal_email, paypal_password, log_fn,
-            sms_controller=sms_controller,
-        )
-    else:
-        log_fn(f"[协议] 当前 PayPal URL 不在预期路径: {paypal_final_url[:100]}")
-        log_fn("[协议] 尝试直接在当前页面提交 checkout 表单...")
-        final_html, final_url = _paypal_submit_checkout(
-            session, paypal_html, paypal_final_url,
-            identity, config, paypal_email, paypal_password, log_fn,
-            sms_controller=sms_controller,
-        )
-
-    # === Step 5: 跟踪最终重定向，检测支付结果 ===
-    log_fn(f"[协议] 最终页面 URL: {final_url[:100]}...")
-
-    if _check_payment_success(final_html, final_url):
+    if success:
         result.success = True
         result.subscription_status = "plus"
         log_fn("[协议] 支付成功！ChatGPT Plus 已激活")
     else:
-        # 检查是否有回调重定向到 ChatGPT
-        redirect_url = _extract_meta_redirect(final_html) or _extract_js_redirect(final_html)
-        if redirect_url:
-            log_fn(f"[协议] 跟踪最终重定向: {redirect_url[:80]}...")
-            try:
-                resp = session.get(
-                    redirect_url,
-                    headers=_navigate_headers(final_url),
-                    allow_redirects=True,
-                )
-                if _check_payment_success(resp.text, str(resp.url)):
-                    result.success = True
-                    result.subscription_status = "plus"
-                    log_fn("[协议] 支付成功！ChatGPT Plus 已激活")
-                else:
-                    result.error = f"支付结果未确认 (URL: {str(resp.url)[:80]})"
-                    log_fn(f"[协议] {result.error}")
-            except Exception as e:
-                result.error = f"跟踪最终重定向失败: {e}"
-                log_fn(f"[协议] {result.error}")
-        else:
-            result.error = f"支付结果未确认 (URL: {final_url[:80]})"
-            log_fn(f"[协议] {result.error}")
-            log_fn(f"[协议] 页面内容片段: {final_html[:500]}...")
+        result.error = "PayPal 支付流程未确认成功"
+        log_fn(f"[协议] {result.error}")
 
     return result
+
+
+def _browser_paypal_flow(
+    pm_redirect_url: str,
+    paypal_url: str,
+    identity,
+    config: ProtocolPaymentConfig,
+    paypal_email: str,
+    paypal_password: str,
+    log_fn: Callable[[str], None],
+    sms_controller=None,
+) -> bool:
+    """使用 Playwright 浏览器处理 PayPal 支付流程，从 pm-redirects 自然跳转绕过 DataDome"""
+    from playwright.sync_api import sync_playwright
+    from platforms.chatgpt.auto_payment import (
+        _handle_paypal_pay_page,
+        _handle_paypal_checkout_page,
+        _wait_for_paypal_checkout,
+        _wait_for_success,
+        _handle_sms_verification,
+        _JS_HIDE_CAPTCHA,
+        PaymentConfig,
+    )
+
+    browser_config = PaymentConfig(
+        country=config.country,
+        proxy=config.proxy,
+        headless=config.headless,
+        payment_timeout=config.payment_timeout,
+        phone=config.phone,
+        card_number=config.card_number,
+        card_expiry=config.card_expiry,
+        card_cvv=config.card_cvv,
+    )
+
+    with sync_playwright() as p:
+        launch_args = {
+            "headless": config.headless,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1280,800",
+            ],
+        }
+        if config.proxy:
+            launch_args["proxy"] = {"server": config.proxy}
+
+        browser = p.chromium.launch(**launch_args)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=_CHROME_UA,
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+
+        from playwright_stealth import Stealth
+        page = context.new_page()
+        Stealth().apply_stealth_sync(page)
+
+        try:
+            # 从 pm-redirects.stripe.com 开始导航，让浏览器自然跟随 302 到 PayPal
+            # 这样 Referer 是 stripe.com，导航类型是 redirect，更接近真实用户行为
+            nav_url = pm_redirect_url or paypal_url
+            log_fn(f"[浏览器] 从 Stripe redirect 导航到 PayPal...")
+            page.goto(nav_url, timeout=60000, referer="https://pay.openai.com/")
+            page.wait_for_load_state("domcontentloaded", timeout=30000)
+            page.evaluate(_JS_HIDE_CAPTCHA)
+
+            current_url = page.url
+            log_fn(f"[浏览器] PayPal 页面加载完成: {current_url[:80]}")
+
+            if "/agreements/approve" in current_url:
+                log_fn("[浏览器] agreements/approve 页面，等待跳转...")
+                for _ in range(15):
+                    page.wait_for_timeout(2000)
+                    new_url = page.url
+                    if new_url != current_url:
+                        current_url = new_url
+                        log_fn(f"[浏览器] 跳转到: {current_url[:80]}")
+                        break
+                else:
+                    log_fn("[浏览器] agreements 页面未跳转，尝试直接处理")
+
+            if "/pay" in current_url and "/checkoutweb" not in current_url:
+                log_fn("[浏览器] PayPal /pay 邮箱页面...")
+                _handle_paypal_pay_page(page, paypal_email, log_fn)
+
+                log_fn("[浏览器] 等待 PayPal checkout 页面...")
+                checkout_page = _wait_for_paypal_checkout(page, context, log_fn, timeout=30)
+                if checkout_page:
+                    checkout_page.evaluate(_JS_HIDE_CAPTCHA)
+                    _handle_paypal_checkout_page(
+                        checkout_page, identity, browser_config,
+                        paypal_email, paypal_password, log_fn,
+                        sms_controller=sms_controller,
+                    )
+                else:
+                    log_fn("[浏览器] 未跳转到 checkout 页面，尝试当前页面")
+
+            elif "/checkoutweb" in current_url:
+                log_fn("[浏览器] PayPal /checkoutweb 页面...")
+                _handle_paypal_checkout_page(
+                    page, identity, browser_config,
+                    paypal_email, paypal_password, log_fn,
+                    sms_controller=sms_controller,
+                )
+            else:
+                log_fn(f"[浏览器] 未知 PayPal 页面: {current_url[:100]}")
+                _handle_paypal_checkout_page(
+                    page, identity, browser_config,
+                    paypal_email, paypal_password, log_fn,
+                    sms_controller=sms_controller,
+                )
+
+            log_fn("[浏览器] 等待支付结果...")
+            if _wait_for_success(context, timeout=config.payment_timeout):
+                return True
+            else:
+                log_fn("[浏览器] 支付确认超时")
+                return False
+
+        except Exception as e:
+            log_fn(f"[浏览器] PayPal 流程异常: {e}")
+            import traceback
+            log_fn(f"[浏览器] 堆栈: {traceback.format_exc()}")
+            return False
+        finally:
+            browser.close()
